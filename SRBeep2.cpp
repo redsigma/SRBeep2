@@ -25,7 +25,7 @@ Now: EBK21 chkd13303@gmail.com
 
 
 #define EXIT_WITH_ERROR(x) do { \
-        blog(LOG_ERROR, "Failed to play audio! At %s:%s", __FILE__, x); \
+        blog(LOG_ERROR, "Failed to play audio! At %s:%d", __FILE__, (int)(x)); \
         blog(LOG_ERROR, SDL_GetError()); \
         goto exit; \
 } while(0)

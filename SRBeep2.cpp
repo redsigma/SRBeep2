@@ -9,6 +9,12 @@ Now: EBK21 chkd13303@gmail.com
 #include <atomic>
 #include <sstream>
 #include <mutex>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <chrono>
+#include <algorithm>
+#include <cctype>
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -24,6 +30,18 @@ Now: EBK21 chkd13303@gmail.com
         goto exit; \
 } while(0)
 
+struct RecordStartMuteConfig {
+        bool enabled = false;
+        uint32_t duration_ms = 1200;
+        std::vector<std::string> source_names;
+};
+
+struct SourceMuteState {
+        std::string name;
+        bool was_muted = false;
+        obs_source_t *source = NULL;
+};
+
 std::mutex audioMutex;
 std::thread st_stt_Thread, st_sto_Thread, rc_stt_Thread, rc_sto_Thread, bf_stt_Thread, bf_sto_Thread, ps_stt_Thread, ps_sto_Thread;
 std::atomic_int queue = 0;
@@ -34,46 +52,169 @@ thread_local MIX_Track* track = NULL;
 
 OBS_DECLARE_MODULE()
 
-extern "C" void obs_module_unload(void) {
-        if (st_stt_Thread.joinable()) {
-                st_stt_Thread.join();
+std::string clean_path(std::string audio_path) {
+        std::string cleaned_path;
+        if (audio_path.find("..") != std::string::npos) {
+                size_t pos = audio_path.find("..");
+                cleaned_path = audio_path.substr(pos);
         }
-        if (st_sto_Thread.joinable()) {
-                st_sto_Thread.join();
+        else {
+                #ifdef _WIN32
+                while (audio_path.length() > 0 && islower((unsigned char)audio_path[0])) {
+                        audio_path = audio_path.substr(1);
+                }
+                #else
+                while (audio_path.length() > 0 && audio_path.substr(0, 1) != "/") {
+                        audio_path = audio_path.substr(1);
+                }
+                #endif
+                cleaned_path = audio_path;
         }
-        if (rc_stt_Thread.joinable()) {
-                rc_stt_Thread.join();
-        }
-        if (rc_sto_Thread.joinable()) {
-                rc_sto_Thread.join();
-        }
-        if (bf_stt_Thread.joinable()) {
-                bf_stt_Thread.join();
-        }
-        if (bf_sto_Thread.joinable()) {
-                bf_sto_Thread.join();
-        }
-        if (ps_stt_Thread.joinable()) {
-                ps_stt_Thread.join();
-        }
-        if (ps_sto_Thread.joinable()) {
-                ps_sto_Thread.join();
-        }
-        MIX_Quit();
-        SDL_Quit();
-        return;
+        return cleaned_path;
 }
 
-extern "C" const char * obs_module_author(void) {
-        return "EBK21";
+static std::string trim_copy(const std::string &value) {
+        size_t first = 0;
+        while (first < value.size() && std::isspace((unsigned char)value[first])) {
+                ++first;
+        }
+
+        if (first == value.size()) {
+                return std::string();
+        }
+
+        size_t last = value.size();
+        while (last > first && std::isspace((unsigned char)value[last - 1])) {
+                --last;
+        }
+
+        return value.substr(first, last - first);
 }
 
-extern "C" const char * obs_module_name(void) {
-        return "Stream/Recording Start/Stop Beeps";
+static std::string lowercase_copy(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return value;
 }
 
-extern "C" const char * obs_module_description(void) {
-        return "Adds audio sound when streaming/recording/buffer starts/stops or when recording is paused/unpaused.";
+static bool parse_bool_value(const std::string &value) {
+        std::string lowered = lowercase_copy(trim_copy(value));
+        return lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on";
+}
+
+static uint32_t parse_duration_ms(const std::string &value, uint32_t fallback) {
+        std::string trimmed = trim_copy(value);
+        if (trimmed.empty()) {
+                return fallback;
+        }
+
+        try {
+                long long parsed = std::stoll(trimmed);
+                if (parsed < 0) {
+                        return fallback;
+                }
+                if (parsed > 60000) {
+                        return 60000;
+                }
+                return (uint32_t)parsed;
+        } catch (...) {
+                return fallback;
+        }
+}
+
+static std::vector<std::string> parse_sources_csv(const std::string &value) {
+        std::vector<std::string> source_names;
+        std::stringstream parser(value);
+        std::string token;
+
+        while (std::getline(parser, token, ',')) {
+                std::string cleaned = trim_copy(token);
+                if (!cleaned.empty()) {
+                        source_names.push_back(cleaned);
+                }
+        }
+
+        return source_names;
+}
+
+static RecordStartMuteConfig load_record_start_mute_config() {
+        RecordStartMuteConfig config;
+
+        const char *obs_data_path = obs_get_module_data_path(obs_current_module());
+        std::stringstream config_path;
+        config_path << obs_data_path;
+        config_path << "/record_start_mute_config.ini";
+        std::string true_path = clean_path(config_path.str());
+
+        std::ifstream file(true_path);
+        if (!file.is_open()) {
+                blog(LOG_INFO, "SRBeep2: record_start_mute_config.ini not found. Source muting is disabled.");
+                return config;
+        }
+
+        std::string line;
+        while (std::getline(file, line)) {
+                std::string cleaned = trim_copy(line);
+                if (cleaned.empty() || cleaned[0] == '#' || cleaned[0] == ';') {
+                        continue;
+                }
+
+                size_t separator = cleaned.find('=');
+                if (separator == std::string::npos) {
+                        continue;
+                }
+
+                std::string key = lowercase_copy(trim_copy(cleaned.substr(0, separator)));
+                std::string value = trim_copy(cleaned.substr(separator + 1));
+
+                if (key == "enabled") {
+                        config.enabled = parse_bool_value(value);
+                } else if (key == "duration_ms") {
+                        config.duration_ms = parse_duration_ms(value, config.duration_ms);
+                } else if (key == "sources") {
+                        config.source_names = parse_sources_csv(value);
+                }
+        }
+
+        return config;
+}
+
+static std::vector<SourceMuteState> mute_configured_sources(const std::vector<std::string> &source_names) {
+        std::vector<SourceMuteState> muted_sources;
+
+        for (const std::string &name : source_names) {
+                obs_source_t *source = obs_get_source_by_name(name.c_str());
+                if (!source) {
+                        blog(LOG_WARNING, "SRBeep2: Source '%s' was not found for temporary muting.", name.c_str());
+                        continue;
+                }
+
+                bool was_muted = obs_source_muted(source);
+                if (!was_muted) {
+                        obs_source_set_muted(source, true);
+                }
+
+                SourceMuteState state;
+                state.name = name;
+                state.was_muted = was_muted;
+                state.source = source;
+                muted_sources.push_back(state);
+        }
+
+        return muted_sources;
+}
+
+static void restore_muted_sources(std::vector<SourceMuteState> &muted_sources) {
+        for (SourceMuteState &state : muted_sources) {
+                if (!state.source) {
+                        continue;
+                }
+
+                obs_source_set_muted(state.source, state.was_muted);
+                obs_source_release(state.source);
+                state.source = NULL;
+        }
+
+        muted_sources.clear();
 }
 
 void play_clip(const char * filepath) {
@@ -116,29 +257,6 @@ exit:
         return;
 }
 
-std::string clean_path(std::string audio_path) {
-        std::string cleaned_path;
-        //If relative path then the first 2 chars should be ".."
-        if (audio_path.find("..") != std::string::npos) {
-                size_t pos = audio_path.find("..");
-                cleaned_path = audio_path.substr(pos);
-        }
-        //If absolute path, Windows will start with a capital, Linux/Mac will start with "/"
-        else {
-                #ifdef _WIN32
-                while (islower(audio_path[0]) && audio_path.length() > 0) {
-                        audio_path = audio_path.substr(1);
-                }
-                #else
-                while (audio_path.substr(0, 1) != "/" && audio_path.length() > 0) {
-                        audio_path = audio_path.substr(1);
-                }
-                #endif
-                cleaned_path = audio_path;
-        }
-        return cleaned_path;
-}
-
 void play_sound(std::string file_name) {
         const char * obs_data_path = obs_get_module_data_path(obs_current_module());
         std::stringstream audio_path;
@@ -153,6 +271,34 @@ void play_sound(std::string file_name) {
         return;
 }
 
+static void play_record_start_sound_with_optional_source_mute() {
+        RecordStartMuteConfig config = load_record_start_mute_config();
+
+        if (!config.enabled || config.source_names.empty()) {
+                play_sound("/record_start_sound.mp3");
+                return;
+        }
+
+        std::vector<SourceMuteState> muted_sources = mute_configured_sources(config.source_names);
+
+        if (muted_sources.empty()) {
+                play_sound("/record_start_sound.mp3");
+                return;
+        }
+
+        auto mute_start = std::chrono::steady_clock::now();
+        play_sound("/record_start_sound.mp3");
+
+        uint32_t elapsed_ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - mute_start).count();
+
+        if (config.duration_ms > elapsed_ms) {
+                SDL_Delay(config.duration_ms - elapsed_ms);
+        }
+
+        restore_muted_sources(muted_sources);
+}
+
 void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, void * private_data) {
         if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED) {
                 if (st_stt_Thread.joinable()) {
@@ -163,7 +309,7 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
                 if (rc_stt_Thread.joinable()) {
                         rc_stt_Thread.join();
                 }
-                rc_stt_Thread = std::thread(play_sound, "/record_start_sound.mp3");
+                rc_stt_Thread = std::thread(play_record_start_sound_with_optional_source_mute);
         } else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED) {
                 if (bf_stt_Thread.joinable()) {
                         bf_stt_Thread.join();
@@ -195,6 +341,48 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
                 }
                 ps_stt_Thread = std::thread(play_sound, "/pause_stop_sound.mp3");
         }
+}
+
+extern "C" void obs_module_unload(void) {
+        if (st_stt_Thread.joinable()) {
+                st_stt_Thread.join();
+        }
+        if (st_sto_Thread.joinable()) {
+                st_sto_Thread.join();
+        }
+        if (rc_stt_Thread.joinable()) {
+                rc_stt_Thread.join();
+        }
+        if (rc_sto_Thread.joinable()) {
+                rc_sto_Thread.join();
+        }
+        if (bf_stt_Thread.joinable()) {
+                bf_stt_Thread.join();
+        }
+        if (bf_sto_Thread.joinable()) {
+                bf_sto_Thread.join();
+        }
+        if (ps_stt_Thread.joinable()) {
+                ps_stt_Thread.join();
+        }
+        if (ps_sto_Thread.joinable()) {
+                ps_sto_Thread.join();
+        }
+        MIX_Quit();
+        SDL_Quit();
+        return;
+}
+
+extern "C" const char * obs_module_author(void) {
+        return "EBK21";
+}
+
+extern "C" const char * obs_module_name(void) {
+        return "Stream/Recording Start/Stop Beeps";
+}
+
+extern "C" const char * obs_module_description(void) {
+        return "Adds audio sound when streaming/recording/buffer starts/stops or when recording is paused/unpaused.";
 }
 
 extern "C" bool obs_module_load(void) {

@@ -55,9 +55,11 @@ std::atomic_int queue = 0;
 struct SoundJob {
         std::string file_name;
         bool apply_record_start_mute = false;
+        bool clear_interrupt_before_play = false;
 };
 
 std::deque<SoundJob> audioJobs;
+std::atomic_bool interrupt_current_track = false;
 
 MIX_Mixer* sdlmixer = NULL;
 thread_local MIX_Audio* audio = NULL;
@@ -274,6 +276,11 @@ void play_clip(const char * filepath) {
                 EXIT_WITH_ERROR(__LINE__);
 
         while (MIX_TrackPlaying(track) && sound) {
+                const bool should_stop_current_playback = interrupt_current_track.exchange(false);
+                if (should_stop_current_playback) {
+                        MIX_StopTrack(track);
+                        break;
+                }
                 SDL_Delay(60 + 30 * (queue - 1));
         }
 
@@ -370,6 +377,23 @@ static void queue_sound_job(const char *file_name, bool apply_record_start_mute 
         audioJobCv.notify_one();
 }
 
+static void queue_stop_sound_job(const char *file_name) {
+        {
+                std::lock_guard<std::mutex> lock(audioJobMutex);
+                interrupt_current_track = true;
+                audioJobs.clear();
+
+                SoundJob job;
+                if (file_name != NULL) {
+                        job.file_name = file_name;
+                }
+                job.apply_record_start_mute = false;
+                job.clear_interrupt_before_play = true;
+                audioJobs.push_back(job);
+        }
+        audioJobCv.notify_one();
+}
+
 static void audio_worker_loop() {
         while (true) {
                 SoundJob job;
@@ -385,6 +409,10 @@ static void audio_worker_loop() {
 
                         job = audioJobs.front();
                         audioJobs.pop_front();
+                }
+
+                if (job.clear_interrupt_before_play) {
+                        interrupt_current_track = false;
                 }
 
                 if (job.apply_record_start_mute) {
@@ -405,11 +433,11 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_PAUSED) {
                 queue_sound_job("/pause_start_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
-                queue_sound_job("/stream_stop_sound.mp3");
+                queue_stop_sound_job("/stream_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_STOPPED) {
-                queue_sound_job("/record_stop_sound.mp3");
+                queue_stop_sound_job("/record_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED) {
-                queue_sound_job("/buffer_stop_sound.mp3");
+                queue_stop_sound_job("/buffer_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_UNPAUSED) {
                 queue_sound_job("/pause_stop_sound.mp3");
         }
@@ -419,7 +447,9 @@ extern "C" void obs_module_unload(void) {
         obs_frontend_remove_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
         {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
+                interrupt_current_track = true;
                 audioWorkerRunning = false;
+                audioJobs.clear();
         }
         audioJobCv.notify_all();
         if (audioWorkerThread.joinable()) {

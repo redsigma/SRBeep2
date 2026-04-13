@@ -34,7 +34,8 @@ Now: EBK21 chkd13303@gmail.com
 
 struct RecordStartMuteConfig {
         bool enabled = false;
-        uint32_t duration_ms = 1200;
+        bool skip_already_muted_sources = true;
+        uint32_t max_duration_limit_ms = 0;
         std::vector<std::string> source_names;
 };
 
@@ -117,7 +118,7 @@ static bool parse_bool_value(const std::string &value) {
         return lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on";
 }
 
-static uint32_t parse_duration_ms(const std::string &value, uint32_t fallback) {
+static uint32_t parse_nonnegative_u32(const std::string &value, uint32_t fallback, uint32_t max_value) {
         std::string trimmed = trim_copy(value);
         if (trimmed.empty()) {
                 return fallback;
@@ -128,8 +129,8 @@ static uint32_t parse_duration_ms(const std::string &value, uint32_t fallback) {
                 if (parsed < 0) {
                         return fallback;
                 }
-                if (parsed > 60000) {
-                        return 60000;
+                if (parsed > max_value) {
+                        return max_value;
                 }
                 return (uint32_t)parsed;
         } catch (...) {
@@ -152,18 +153,18 @@ static std::vector<std::string> parse_sources_csv(const std::string &value) {
         return source_names;
 }
 
-static RecordStartMuteConfig load_record_start_mute_config() {
+static RecordStartMuteConfig load_record_config() {
         RecordStartMuteConfig config;
 
         const char *obs_data_path = obs_get_module_data_path(obs_current_module());
         std::stringstream config_path;
         config_path << obs_data_path;
-        config_path << "/record_start_mute_config.ini";
+        config_path << "/record_config.ini";
         std::string true_path = clean_path(config_path.str());
 
         std::ifstream file(true_path);
         if (!file.is_open()) {
-                blog(LOG_INFO, "SRBeep2: record_start_mute_config.ini not found. Source muting is disabled.");
+                blog(LOG_INFO, "SRBeep2: record_config.ini not found. Source muting is disabled.");
                 return config;
         }
 
@@ -184,8 +185,11 @@ static RecordStartMuteConfig load_record_start_mute_config() {
 
                 if (key == "enabled") {
                         config.enabled = parse_bool_value(value);
-                } else if (key == "duration_ms") {
-                        config.duration_ms = parse_duration_ms(value, config.duration_ms);
+                } else if (key == "skip_already_muted_sources") {
+                        config.skip_already_muted_sources = parse_bool_value(value);
+                } else if (key == "max_duration_limit") {
+                        uint32_t seconds = parse_nonnegative_u32(value, config.max_duration_limit_ms / 1000, 3600);
+                        config.max_duration_limit_ms = seconds * 1000;
                 } else if (key == "sources") {
                         config.source_names = parse_sources_csv(value);
                 }
@@ -194,10 +198,10 @@ static RecordStartMuteConfig load_record_start_mute_config() {
         return config;
 }
 
-static std::vector<SourceMuteState> mute_configured_sources(const std::vector<std::string> &source_names) {
+static std::vector<SourceMuteState> mute_configured_sources(const RecordStartMuteConfig &config) {
         std::vector<SourceMuteState> muted_sources;
 
-        for (const std::string &name : source_names) {
+        for (const std::string &name : config.source_names) {
                 obs_source_t *source = obs_get_source_by_name(name.c_str());
                 if (!source) {
                         blog(LOG_WARNING, "SRBeep2: Source '%s' was not found for temporary muting.", name.c_str());
@@ -205,6 +209,10 @@ static std::vector<SourceMuteState> mute_configured_sources(const std::vector<st
                 }
 
                 bool was_muted = obs_source_muted(source);
+                if (config.skip_already_muted_sources && was_muted) {
+                        obs_source_release(source);
+                        continue;
+                }
                 if (!was_muted) {
                         obs_source_set_muted(source, true);
                 }
@@ -219,13 +227,17 @@ static std::vector<SourceMuteState> mute_configured_sources(const std::vector<st
         return muted_sources;
 }
 
-static void restore_muted_sources(std::vector<SourceMuteState> &muted_sources) {
+static void restore_muted_sources(std::vector<SourceMuteState> &muted_sources, bool skip_already_muted_sources) {
         for (SourceMuteState &state : muted_sources) {
                 if (!state.source) {
                         continue;
                 }
 
-                obs_source_set_muted(state.source, state.was_muted);
+                if (skip_already_muted_sources) {
+                        obs_source_set_muted(state.source, state.was_muted);
+                } else {
+                        obs_source_set_muted(state.source, false);
+                }
                 obs_source_release(state.source);
                 state.source = NULL;
         }
@@ -294,31 +306,55 @@ void play_sound(std::string file_name) {
 }
 
 static void play_record_start_sound_with_optional_source_mute() {
-        RecordStartMuteConfig config = load_record_start_mute_config();
+        RecordStartMuteConfig config = load_record_config();
 
         if (!config.enabled || config.source_names.empty()) {
                 play_sound("/record_start_sound.mp3");
                 return;
         }
 
-        std::vector<SourceMuteState> muted_sources = mute_configured_sources(config.source_names);
+        std::vector<SourceMuteState> muted_sources = mute_configured_sources(config);
 
         if (muted_sources.empty()) {
                 play_sound("/record_start_sound.mp3");
                 return;
         }
 
-        auto mute_start = std::chrono::steady_clock::now();
-        play_sound("/record_start_sound.mp3");
+        std::atomic_bool playback_finished = false;
+        std::mutex restore_mutex;
+        bool restored = false;
+        auto restore_once = [&]() {
+                std::lock_guard<std::mutex> lock(restore_mutex);
+                if (restored) {
+                        return;
+                }
+                restore_muted_sources(muted_sources, config.skip_already_muted_sources);
+                restored = true;
+        };
 
-        uint32_t elapsed_ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - mute_start).count();
+        std::thread max_duration_thread;
+        if (config.max_duration_limit_ms > 0) {
+                max_duration_thread = std::thread([&]() {
+                        uint32_t waited_ms = 0;
+                        while (!playback_finished.load() && waited_ms < config.max_duration_limit_ms) {
+                                const uint32_t step_ms = 20;
+                                SDL_Delay(step_ms);
+                                waited_ms += step_ms;
+                        }
 
-        if (config.duration_ms > elapsed_ms) {
-                SDL_Delay(config.duration_ms - elapsed_ms);
+                        if (!playback_finished.load()) {
+                                restore_once();
+                        }
+                });
         }
 
-        restore_muted_sources(muted_sources);
+        play_sound("/record_start_sound.mp3");
+        playback_finished = true;
+        restore_once();
+
+        if (max_duration_thread.joinable()) {
+                max_duration_thread.join();
+        }
 }
 
 static void queue_sound_job(const char *file_name, bool apply_record_start_mute = false) {

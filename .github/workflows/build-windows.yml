@@ -34,6 +34,9 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile 'llvm-mingw.zip'
           Expand-Archive -Path 'llvm-mingw.zip' -DestinationPath 'toolchain' -Force
 
+          $llvmRoot = (Get-ChildItem 'toolchain' -Directory | Select-Object -First 1).FullName
+          "LLVM_ROOT=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Download OBS SDK inputs
         shell: pwsh
         env:
@@ -68,7 +71,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          cmake -S 'obs-studio-src' -B 'obs-build' `
+          cmake -S 'obs-studio-src' -B 'obs-build' -G "Visual Studio 17 2022" -A x64 `
             -DENABLE_UI=OFF `
             -DENABLE_SCRIPTING=OFF `
             -DENABLE_PLUGINS=OFF `
@@ -84,43 +87,98 @@ jobs:
           $generatedIncludeDir = Split-Path -Parent $generatedObsConfig.FullName
           "OBS_GENERATED_INCLUDE=$generatedIncludeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Download SDL3
+      - name: Download SDL3 source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $version = '${{ env.SDL3_VERSION }}'
-          $url = "https://github.com/libsdl-org/SDL/releases/download/release-$version/SDL3-devel-$version-mingw.zip"
+          $url = "https://github.com/libsdl-org/SDL/archive/refs/tags/release-$version.zip"
 
-          Invoke-WebRequest -Uri $url -OutFile 'sdl3-devel.zip'
-          Expand-Archive -Path 'sdl3-devel.zip' -DestinationPath 'sdl3' -Force
+          Invoke-WebRequest -Uri $url -OutFile 'sdl3-src.zip'
+          Expand-Archive -Path 'sdl3-src.zip' -DestinationPath 'sdl3-src' -Force
 
-      - name: Download SDL3_mixer
+      - name: Build and install SDL3 static
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvmRoot = $env:LLVM_ROOT
+          $cc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang.exe')).Path -replace '\\', '/'
+          $cxx = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang++.exe')).Path -replace '\\', '/'
+          $rc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-windres.exe')).Path -replace '\\', '/'
+          $sdlSource = (Get-ChildItem 'sdl3-src' -Directory | Select-Object -First 1).FullName
+          $sdlInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-install'
+
+          cmake -S $sdlSource -B 'sdl3-build' -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$cc" `
+            -DCMAKE_CXX_COMPILER="$cxx" `
+            -DCMAKE_RC_COMPILER="$rc" `
+            -DCMAKE_INSTALL_PREFIX="$sdlInstall" `
+            -DSDL_SHARED=OFF `
+            -DSDL_STATIC=ON `
+            -DSDL_TEST=OFF `
+            -DSDL_TEST_LIBRARY=OFF
+
+          cmake --build 'sdl3-build' --config Release
+          cmake --install 'sdl3-build' --config Release
+
+      - name: Download SDL3_mixer source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $version = '${{ env.SDL3_MIXER_VERSION }}'
-          $url = "https://github.com/libsdl-org/SDL_mixer/releases/download/release-$version/SDL3_mixer-devel-$version-mingw.zip"
+          $url = "https://github.com/libsdl-org/SDL_mixer/archive/refs/tags/release-$version.zip"
 
-          Invoke-WebRequest -Uri $url -OutFile 'sdl3-mixer-devel.zip'
-          Expand-Archive -Path 'sdl3-mixer-devel.zip' -DestinationPath 'sdl3-mixer' -Force
+          Invoke-WebRequest -Uri $url -OutFile 'sdl3-mixer-src.zip'
+          Expand-Archive -Path 'sdl3-mixer-src.zip' -DestinationPath 'sdl3-mixer-src' -Force
+
+      - name: Build and install SDL3_mixer static
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvmRoot = $env:LLVM_ROOT
+          $cc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang.exe')).Path -replace '\\', '/'
+          $cxx = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang++.exe')).Path -replace '\\', '/'
+          $rc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-windres.exe')).Path -replace '\\', '/'
+          $sdlMixerSource = (Get-ChildItem 'sdl3-mixer-src' -Directory | Select-Object -First 1).FullName
+          $sdlInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-install'
+          $sdlMixerInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-mixer-install'
+
+          cmake -S $sdlMixerSource -B 'sdl3-mixer-build' -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$cc" `
+            -DCMAKE_CXX_COMPILER="$cxx" `
+            -DCMAKE_RC_COMPILER="$rc" `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DCMAKE_PREFIX_PATH="$sdlInstall" `
+            -DCMAKE_INSTALL_PREFIX="$sdlMixerInstall" `
+            -DSDL3MIXER_VENDORED=ON `
+            -DSDL3MIXER_DEPS_SHARED=OFF `
+            -DSDL3MIXER_SAMPLES=OFF `
+            -DSDL3MIXER_STATIC=ON `
+            -DSDL3MIXER_SHARED=OFF
+
+          cmake --build 'sdl3-mixer-build' --config Release
+          cmake --install 'sdl3-mixer-build' --config Release
 
       - name: Compile (Clang)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $llvmRoot = (Get-ChildItem 'toolchain' -Directory | Select-Object -First 1).FullName
+          $llvmRoot = $env:LLVM_ROOT
           $clang = Join-Path $llvmRoot 'bin\clang++.exe'
 
-          $sdlRoot = (Get-ChildItem 'sdl3' -Directory | Select-Object -First 1).FullName
-          $sdlPrefix = Join-Path $sdlRoot 'x86_64-w64-mingw32'
-          $sdlInclude = Join-Path $sdlPrefix 'include'
-          $sdlLib = Join-Path $sdlPrefix 'lib'
+          $sdlInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-install'
+          $sdlInclude = Join-Path $sdlInstall 'include'
+          $sdlLib = Join-Path $sdlInstall 'lib'
 
-          $sdlMixerRoot = (Get-ChildItem 'sdl3-mixer' -Directory | Select-Object -First 1).FullName
-          $sdlMixerPrefix = Join-Path $sdlMixerRoot 'x86_64-w64-mingw32'
-          $sdlMixerInclude = Join-Path $sdlMixerPrefix 'include'
-          $sdlMixerLib = Join-Path $sdlMixerPrefix 'lib'
+          $sdlMixerInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-mixer-install'
+          $sdlMixerInclude = Join-Path $sdlMixerInstall 'include'
+          $sdlMixerLib = Join-Path $sdlMixerInstall 'lib'
+
+          $sdlStatic = Join-Path $sdlLib 'libSDL3.a'
+          $sdlMixerStatic = Join-Path $sdlMixerLib 'libSDL3_mixer.a'
 
           $obsSrc = Join-Path $env:GITHUB_WORKSPACE 'obs-studio-src'
           $obsBin = Join-Path $env:GITHUB_WORKSPACE 'obs-runtime\bin\64bit'
@@ -134,9 +192,7 @@ jobs:
             (Join-Path $obsBin 'obs.dll'),
             (Join-Path $obsBin 'obs-frontend-api.dll'),
             (Join-Path $sdlInclude 'SDL3\SDL.h'),
-            (Join-Path $sdlMixerInclude 'SDL3_mixer\SDL_mixer.h'),
-            (Join-Path $sdlLib 'libSDL3.dll.a'),
-            (Join-Path $sdlMixerLib 'libSDL3_mixer.dll.a')
+            (Join-Path $sdlMixerInclude 'SDL3_mixer\SDL_mixer.h')
           )
 
           foreach ($path in $requiredPaths) {
@@ -145,10 +201,24 @@ jobs:
             }
           }
 
+          Write-Host "SDL lib directory: $sdlLib"
+          Get-ChildItem -Path $sdlLib -Filter '*.a' -File | ForEach-Object { Write-Host "SDL archive: $($_.Name)" }
+          Write-Host "SDL_mixer lib directory: $sdlMixerLib"
+          Get-ChildItem -Path $sdlMixerLib -Filter '*.a' -File | ForEach-Object { Write-Host "SDL_mixer archive: $($_.Name)" }
+
+          if (-not (Test-Path $sdlStatic)) {
+            throw "Static SDL3 library required but not found: $sdlStatic"
+          }
+          if (-not (Test-Path $sdlMixerStatic)) {
+            throw "Static SDL3_mixer library required but not found: $sdlMixerStatic"
+          }
+
           $args = @(
             '--target=x86_64-w64-windows-gnu',
             '-flto',
             '-Oz',
+            '-static-libgcc',
+            '-static-libstdc++',
             "-I$obsSrc\libobs",
             "-I$obsSrc\frontend\api",
             "-I$obsGeneratedInclude",
@@ -159,9 +229,12 @@ jobs:
             "-L$obsBin",
             'SRBeep2.cpp',
             "$obsBin\obs.dll",
-            "$obsBin\obs-frontend-api.dll",
-            '-lSDL3_mixer',
-            '-lSDL3',
+            "$obsBin\obs-frontend-api.dll"
+          )
+
+          $sdlLinkArgs = @("-Wl,-Bstatic", $sdlMixerStatic, $sdlStatic, "-Wl,-Bdynamic")
+
+          $tailArgs = @(
             '-lversion',
             '-lshell32',
             '-lwinmm',
@@ -179,6 +252,8 @@ jobs:
             '-o',
             'srbeep2.dll'
           )
+          $args += $sdlLinkArgs
+          $args += $tailArgs
 
           & $clang @args
           if ($LASTEXITCODE -ne 0) {

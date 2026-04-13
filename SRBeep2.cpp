@@ -28,12 +28,6 @@ Now: EBK21 chkd13303@gmail.com
 #include <SDL3_mixer/SDL_mixer.h>
 
 
-#define EXIT_WITH_ERROR(x) do { \
-        blog(LOG_ERROR, "Failed to play audio! At %s:%d", __FILE__, (int)(x)); \
-        blog(LOG_ERROR, SDL_GetError()); \
-        goto exit; \
-} while(0)
-
 struct RecordStartMuteConfig {
         bool enabled = false;
         bool skip_already_muted_sources = true;
@@ -294,29 +288,66 @@ static void restore_muted_sources(std::vector<SourceMuteState> &muted_sources, b
 
 void play_clip(const char * filepath) {
         bool sound = false;
+        audio = NULL;
+        track = NULL;
+
         ++queue;
+        auto cleanup = [&]() {
+                if (likely(NULL != track)) {
+                        MIX_DestroyTrack(track);
+                        track = NULL;
+                }
+                if (likely(NULL != audio)) {
+                        MIX_DestroyAudio(audio);
+                        audio = NULL;
+                }
+                {
+                        std::lock_guard<std::mutex> lock(audioMutex);
+                        --queue;
+                        if (queue == 0 && NULL != sdlmixer) {
+                                MIX_DestroyMixer(sdlmixer);
+                                sdlmixer = NULL;
+                        }
+                }
+        };
+        auto fail = [&](int line) {
+                blog(LOG_ERROR, "Failed to play audio! At %s:%d", __FILE__, line);
+                blog(LOG_ERROR, SDL_GetError());
+                cleanup();
+        };
+
         {
                 std::lock_guard<std::mutex> lock(audioMutex);
                 if (likely(queue == 1)) {
                         sdlmixer = MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
-                        if (unlikely(NULL == sdlmixer))
-                                EXIT_WITH_ERROR(__LINE__);
+                        if (unlikely(NULL == sdlmixer)) {
+                                fail(__LINE__);
+                                return;
+                        }
                 }
         }
 
         audio = MIX_LoadAudio(NULL, filepath, false);
-        if (unlikely(NULL == audio))
-                EXIT_WITH_ERROR(__LINE__);
+        if (unlikely(NULL == audio)) {
+                fail(__LINE__);
+                return;
+        }
 
         track = MIX_CreateTrack(sdlmixer);
-        if (unlikely(!track))
-                EXIT_WITH_ERROR(__LINE__);
+        if (unlikely(!track)) {
+                fail(__LINE__);
+                return;
+        }
 
-        if (unlikely(!MIX_SetTrackStoppedCallback(track, on_track_stopped, NULL)))
-                EXIT_WITH_ERROR(__LINE__);
+        if (unlikely(!MIX_SetTrackStoppedCallback(track, on_track_stopped, NULL))) {
+                fail(__LINE__);
+                return;
+        }
 
-        if (unlikely(!MIX_SetTrackAudio(track, audio)))
-                EXIT_WITH_ERROR(__LINE__);
+        if (unlikely(!MIX_SetTrackAudio(track, audio))) {
+                fail(__LINE__);
+                return;
+        }
 
         {
                 std::lock_guard<std::mutex> lock(playbackStateMutex);
@@ -325,8 +356,10 @@ void play_clip(const char * filepath) {
 
         sound = MIX_PlayTrack(track, 0);
 
-        if (unlikely(!sound))
-                EXIT_WITH_ERROR(__LINE__);
+        if (unlikely(!sound)) {
+                fail(__LINE__);
+                return;
+        }
 
         bool stop_requested_for_track = false;
         bool done_waiting_for_track = false;
@@ -370,19 +403,7 @@ void play_clip(const char * filepath) {
                 MIX_StopTrack(track, fade_out_frames);
                 stop_requested_for_track = true;
         }
-
-exit:
-        if(likely(NULL != track)) MIX_DestroyTrack(track);
-        if(likely(NULL != audio)) MIX_DestroyAudio(audio);
-        {
-                std::lock_guard<std::mutex> lock(audioMutex);
-                --queue;
-                if (queue == 0 && NULL != sdlmixer) {
-                        MIX_DestroyMixer(sdlmixer);
-                        sdlmixer = NULL;
-                }
-        }
-        return;
+        cleanup();
 }
 
 void play_sound(std::string file_name) {

@@ -354,6 +354,8 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
 }
 
 extern "C" void obs_module_unload(void) {
+        obs_frontend_remove_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
+
         if (st_stt_Thread.joinable()) {
                 st_stt_Thread.join();
         }
@@ -396,8 +398,15 @@ extern "C" const char * obs_module_description(void) {
 }
 
 extern "C" bool obs_module_load(void) {
-        SDL_Init(0);
-        MIX_Init();
+        if (SDL_Init(0) < 0) {
+                blog(LOG_ERROR, "SRBeep2: SDL_Init failed: %s", SDL_GetError());
+                return false;
+        }
+        if (!MIX_Init()) {
+                blog(LOG_ERROR, "SRBeep2: MIX_Init failed: %s", SDL_GetError());
+                SDL_Quit();
+                return false;
+        }
         obs_frontend_add_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
         return true;
 }

@@ -54,6 +54,10 @@ OBS_DECLARE_MODULE()
 
 std::string clean_path(std::string audio_path) {
         std::string cleaned_path;
+        if (audio_path.empty()) {
+                return cleaned_path;
+        }
+
         if (audio_path.find("..") != std::string::npos) {
                 size_t pos = audio_path.find("..");
                 cleaned_path = audio_path.substr(pos);

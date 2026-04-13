@@ -220,15 +220,15 @@ static void restore_muted_sources(std::vector<SourceMuteState> &muted_sources) {
 void play_clip(const char * filepath) {
         bool sound = false;
         ++queue;
-        audioMutex.lock();
-        if (likely(queue == 1)) {
-                sdlmixer = MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
-                if (unlikely(NULL == sdlmixer)) {
-                    audioMutex.unlock();
-                    EXIT_WITH_ERROR(__LINE__);
+        {
+                std::lock_guard<std::mutex> lock(audioMutex);
+                if (likely(queue == 1)) {
+                        sdlmixer = MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
+                        if (unlikely(NULL == sdlmixer))
+                                EXIT_WITH_ERROR(__LINE__);
                 }
         }
-        audioMutex.unlock();
+
         audio = MIX_LoadAudio(NULL, filepath, false);
         if (unlikely(NULL == audio))
                 EXIT_WITH_ERROR(__LINE__);
@@ -252,8 +252,14 @@ void play_clip(const char * filepath) {
 exit:
         if(likely(NULL != track)) MIX_DestroyTrack(track);
         if(likely(NULL != audio)) MIX_DestroyAudio(audio);
-        --queue;
-        if (queue == 0 && NULL != sdlmixer) MIX_DestroyMixer(sdlmixer);
+        {
+                std::lock_guard<std::mutex> lock(audioMutex);
+                --queue;
+                if (queue == 0 && NULL != sdlmixer) {
+                        MIX_DestroyMixer(sdlmixer);
+                        sdlmixer = NULL;
+                }
+        }
         return;
 }
 

@@ -9,6 +9,8 @@ Now: EBK21 chkd13303@gmail.com
 #include <atomic>
 #include <sstream>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -43,8 +45,18 @@ struct SourceMuteState {
 };
 
 std::mutex audioMutex;
-std::thread st_stt_Thread, st_sto_Thread, rc_stt_Thread, rc_sto_Thread, bf_stt_Thread, bf_sto_Thread, ps_stt_Thread, ps_sto_Thread;
+std::thread audioWorkerThread;
+std::mutex audioJobMutex;
+std::condition_variable audioJobCv;
+bool audioWorkerRunning = false;
 std::atomic_int queue = 0;
+
+struct SoundJob {
+        std::string file_name;
+        bool apply_record_start_mute = false;
+};
+
+std::deque<SoundJob> audioJobs;
 
 MIX_Mixer* sdlmixer = NULL;
 thread_local MIX_Audio* audio = NULL;
@@ -309,76 +321,73 @@ static void play_record_start_sound_with_optional_source_mute() {
         restore_muted_sources(muted_sources);
 }
 
+static void queue_sound_job(const char *file_name, bool apply_record_start_mute = false) {
+        {
+                std::lock_guard<std::mutex> lock(audioJobMutex);
+                SoundJob job;
+                if (file_name != NULL) {
+                        job.file_name = file_name;
+                }
+                job.apply_record_start_mute = apply_record_start_mute;
+                audioJobs.push_back(job);
+        }
+        audioJobCv.notify_one();
+}
+
+static void audio_worker_loop() {
+        while (true) {
+                SoundJob job;
+                {
+                        std::unique_lock<std::mutex> lock(audioJobMutex);
+                        audioJobCv.wait(lock, [] {
+                                return !audioWorkerRunning || !audioJobs.empty();
+                        });
+
+                        if (!audioWorkerRunning && audioJobs.empty()) {
+                                return;
+                        }
+
+                        job = audioJobs.front();
+                        audioJobs.pop_front();
+                }
+
+                if (job.apply_record_start_mute) {
+                        play_record_start_sound_with_optional_source_mute();
+                } else if (!job.file_name.empty()) {
+                        play_sound(job.file_name);
+                }
+        }
+}
+
 void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, void * private_data) {
         if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED) {
-                if (st_stt_Thread.joinable()) {
-                        st_stt_Thread.join();
-                }
-                st_stt_Thread = std::thread(play_sound, "/stream_start_sound.mp3");
+                queue_sound_job("/stream_start_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_STARTED) {
-                if (rc_stt_Thread.joinable()) {
-                        rc_stt_Thread.join();
-                }
-                rc_stt_Thread = std::thread(play_record_start_sound_with_optional_source_mute);
+                queue_sound_job("/record_start_sound.mp3", true);
         } else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED) {
-                if (bf_stt_Thread.joinable()) {
-                        bf_stt_Thread.join();
-                }
-                bf_stt_Thread = std::thread(play_sound, "/buffer_start_sound.mp3");
+                queue_sound_job("/buffer_start_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_PAUSED) {
-                if (ps_stt_Thread.joinable()) {
-                        ps_stt_Thread.join();
-                }
-                ps_stt_Thread = std::thread(play_sound, "/pause_start_sound.mp3");
+                queue_sound_job("/pause_start_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
-                if (st_sto_Thread.joinable()) {
-                        st_sto_Thread.join();
-                }
-                st_sto_Thread = std::thread(play_sound, "/stream_stop_sound.mp3");
+                queue_sound_job("/stream_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_STOPPED) {
-                if (rc_sto_Thread.joinable()) {
-                        rc_sto_Thread.join();
-                }
-                rc_sto_Thread = std::thread(play_sound, "/record_stop_sound.mp3");
+                queue_sound_job("/record_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED) {
-                if (bf_sto_Thread.joinable()) {
-                        bf_sto_Thread.join();
-                }
-                bf_sto_Thread = std::thread(play_sound, "/buffer_stop_sound.mp3");
+                queue_sound_job("/buffer_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_UNPAUSED) {
-                if (ps_sto_Thread.joinable()) {
-                        ps_sto_Thread.join();
-                }
-                ps_sto_Thread = std::thread(play_sound, "/pause_stop_sound.mp3");
+                queue_sound_job("/pause_stop_sound.mp3");
         }
 }
 
 extern "C" void obs_module_unload(void) {
         obs_frontend_remove_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
-
-        if (st_stt_Thread.joinable()) {
-                st_stt_Thread.join();
+        {
+                std::lock_guard<std::mutex> lock(audioJobMutex);
+                audioWorkerRunning = false;
         }
-        if (st_sto_Thread.joinable()) {
-                st_sto_Thread.join();
-        }
-        if (rc_stt_Thread.joinable()) {
-                rc_stt_Thread.join();
-        }
-        if (rc_sto_Thread.joinable()) {
-                rc_sto_Thread.join();
-        }
-        if (bf_stt_Thread.joinable()) {
-                bf_stt_Thread.join();
-        }
-        if (bf_sto_Thread.joinable()) {
-                bf_sto_Thread.join();
-        }
-        if (ps_stt_Thread.joinable()) {
-                ps_stt_Thread.join();
-        }
-        if (ps_sto_Thread.joinable()) {
-                ps_sto_Thread.join();
+        audioJobCv.notify_all();
+        if (audioWorkerThread.joinable()) {
+                audioWorkerThread.join();
         }
         MIX_Quit();
         SDL_Quit();
@@ -407,6 +416,11 @@ extern "C" bool obs_module_load(void) {
                 SDL_Quit();
                 return false;
         }
+        {
+                std::lock_guard<std::mutex> lock(audioJobMutex);
+                audioWorkerRunning = true;
+        }
+        audioWorkerThread = std::thread(audio_worker_loop);
         obs_frontend_add_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
         return true;
 }

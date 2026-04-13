@@ -17,6 +17,7 @@ Now: EBK21 chkd13303@gmail.com
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -36,6 +37,7 @@ struct RecordStartMuteConfig {
         bool enabled = false;
         bool skip_already_muted_sources = true;
         uint32_t max_duration_limit_ms = 0;
+        uint32_t audio_fade_on_stop_duration_ms = 0;
         std::vector<std::string> source_names;
 };
 
@@ -60,6 +62,11 @@ struct SoundJob {
 
 std::deque<SoundJob> audioJobs;
 std::atomic_bool interrupt_current_track = false;
+std::atomic_uint32_t audio_fade_on_stop_duration_ms = 0;
+
+static constexpr uint32_t playback_poll_base_ms = 60;
+static constexpr uint32_t playback_poll_per_queue_item_ms = 30;
+static constexpr uint32_t max_duration_poll_step_ms = 20;
 
 MIX_Mixer* sdlmixer = NULL;
 thread_local MIX_Audio* audio = NULL;
@@ -140,6 +147,26 @@ static uint32_t parse_nonnegative_u32(const std::string &value, uint32_t fallbac
         }
 }
 
+static uint32_t parse_seconds_to_ms(const std::string &value, uint32_t fallback_ms) {
+        std::string trimmed = trim_copy(value);
+        if (trimmed.empty()) {
+                return fallback_ms;
+        }
+
+        try {
+                double seconds = std::stod(trimmed);
+                if (seconds < 0.0) {
+                        return fallback_ms;
+                }
+
+                double milliseconds = seconds * 1000.0;
+
+                return (uint32_t)std::llround(milliseconds);
+        } catch (...) {
+                return fallback_ms;
+        }
+}
+
 static std::vector<std::string> parse_sources_csv(const std::string &value) {
         std::vector<std::string> source_names;
         std::stringstream parser(value);
@@ -192,6 +219,8 @@ static RecordStartMuteConfig load_record_config() {
                 } else if (key == "max_duration_limit") {
                         uint32_t seconds = parse_nonnegative_u32(value, config.max_duration_limit_ms / 1000, 3600);
                         config.max_duration_limit_ms = seconds * 1000;
+                } else if (key == "audio_fade_on_stop_duration") {
+                        config.audio_fade_on_stop_duration_ms = parse_seconds_to_ms(value, config.audio_fade_on_stop_duration_ms);
                 } else if (key == "sources") {
                         config.source_names = parse_sources_csv(value);
                 }
@@ -275,13 +304,28 @@ void play_clip(const char * filepath) {
         if (unlikely(!sound))
                 EXIT_WITH_ERROR(__LINE__);
 
+        bool stop_requested_for_track = false;
         while (MIX_TrackPlaying(track) && sound) {
-                const bool should_stop_current_playback = interrupt_current_track.exchange(false);
-                if (should_stop_current_playback) {
-                        MIX_StopTrack(track);
-                        break;
+                if (stop_requested_for_track) {
+                        SDL_Delay(playback_poll_base_ms + playback_poll_per_queue_item_ms * (queue - 1));
+                        continue;
                 }
-                SDL_Delay(60 + 30 * (queue - 1));
+
+                const bool should_stop_current_playback = interrupt_current_track.exchange(false);
+                if (!should_stop_current_playback) {
+                        SDL_Delay(playback_poll_base_ms + playback_poll_per_queue_item_ms * (queue - 1));
+                        continue;
+                }
+
+                const uint32_t fade_ms = audio_fade_on_stop_duration_ms.load();
+                Sint64 fade_out_frames = (fade_ms > 0) ? MIX_TrackMSToFrames(track, (Sint64)fade_ms) : 0;
+                if (fade_out_frames < 0) {
+                        fade_out_frames = 0;
+                }
+
+                MIX_StopTrack(track, fade_out_frames);
+                stop_requested_for_track = true;
+                SDL_Delay(playback_poll_base_ms + playback_poll_per_queue_item_ms * (queue - 1));
         }
 
 exit:
@@ -314,6 +358,7 @@ void play_sound(std::string file_name) {
 
 static void play_record_start_sound_with_optional_source_mute() {
         RecordStartMuteConfig config = load_record_config();
+        audio_fade_on_stop_duration_ms = config.audio_fade_on_stop_duration_ms;
 
         if (!config.enabled || config.source_names.empty()) {
                 play_sound("/record_start_sound.mp3");
@@ -344,9 +389,8 @@ static void play_record_start_sound_with_optional_source_mute() {
                 max_duration_thread = std::thread([&]() {
                         uint32_t waited_ms = 0;
                         while (!playback_finished.load() && waited_ms < config.max_duration_limit_ms) {
-                                const uint32_t step_ms = 20;
-                                SDL_Delay(step_ms);
-                                waited_ms += step_ms;
+                                SDL_Delay(max_duration_poll_step_ms);
+                                waited_ms += max_duration_poll_step_ms;
                         }
 
                         if (!playback_finished.load()) {
@@ -483,6 +527,10 @@ extern "C" bool obs_module_load(void) {
                 return false;
         }
         {
+                RecordStartMuteConfig config = load_record_config();
+                audio_fade_on_stop_duration_ms = config.audio_fade_on_stop_duration_ms;
+        }
+        {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
                 audioWorkerRunning = true;
         }
@@ -490,3 +538,4 @@ extern "C" bool obs_module_load(void) {
         obs_frontend_add_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
         return true;
 }
+

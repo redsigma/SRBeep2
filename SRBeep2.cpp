@@ -21,6 +21,7 @@ Now: EBK21 chkd13303@gmail.com
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
+#define unused(x) (void)(x)
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_thread.h>
@@ -43,16 +44,12 @@ struct RecordStartMuteConfig {
 
 struct SourceMuteState {
         std::string name;
-        bool was_muted = false;
         obs_source_t *source = NULL;
+        bool was_muted = false;
 };
 
-std::mutex audioMutex;
-std::thread audioWorkerThread;
-std::mutex audioJobMutex;
-std::condition_variable audioJobCv;
-bool audioWorkerRunning = false;
-std::atomic_int queue = 0;
+static constexpr uint32_t max_duration_poll_step_ms = 20;
+static constexpr uint32_t shutdown_wait_timeout_ms = 2000;
 
 struct SoundJob {
         std::string file_name;
@@ -60,19 +57,38 @@ struct SoundJob {
         bool clear_interrupt_before_play = false;
 };
 
+std::mutex audioMutex;
+std::atomic_int queue = 0;
+
+std::thread audioWorkerThread;
+std::mutex audioJobMutex;
+std::condition_variable audioJobCv;
+bool audioWorkerRunning = false;
 std::deque<SoundJob> audioJobs;
+
 std::atomic_bool interrupt_current_track = false;
 std::atomic_uint32_t audio_fade_on_stop_duration_ms = 0;
+std::atomic_bool shutdown_requested = false;
 
-static constexpr uint32_t playback_poll_base_ms = 60;
-static constexpr uint32_t playback_poll_per_queue_item_ms = 30;
-static constexpr uint32_t max_duration_poll_step_ms = 20;
+std::mutex playbackStateMutex;
+std::condition_variable playbackStateCv;
+bool activeTrackStopped = false;
 
 MIX_Mixer* sdlmixer = NULL;
 thread_local MIX_Audio* audio = NULL;
 thread_local MIX_Track* track = NULL;
 
 OBS_DECLARE_MODULE()
+
+static void SDLCALL on_track_stopped(void *userdata, MIX_Track *stopped_track) {
+        unused(userdata);
+        unused(stopped_track);
+        {
+                std::lock_guard<std::mutex> lock(playbackStateMutex);
+                activeTrackStopped = true;
+        }
+        playbackStateCv.notify_all();
+}
 
 std::string clean_path(std::string audio_path) {
         std::string cleaned_path;
@@ -296,8 +312,16 @@ void play_clip(const char * filepath) {
         if (unlikely(!track))
                 EXIT_WITH_ERROR(__LINE__);
 
+        if (unlikely(!MIX_SetTrackStoppedCallback(track, on_track_stopped, NULL)))
+                EXIT_WITH_ERROR(__LINE__);
+
         if (unlikely(!MIX_SetTrackAudio(track, audio)))
                 EXIT_WITH_ERROR(__LINE__);
+
+        {
+                std::lock_guard<std::mutex> lock(playbackStateMutex);
+                activeTrackStopped = false;
+        }
 
         sound = MIX_PlayTrack(track, 0);
 
@@ -305,15 +329,35 @@ void play_clip(const char * filepath) {
                 EXIT_WITH_ERROR(__LINE__);
 
         bool stop_requested_for_track = false;
-        while (MIX_TrackPlaying(track) && sound) {
-                if (stop_requested_for_track) {
-                        SDL_Delay(playback_poll_base_ms + playback_poll_per_queue_item_ms * (queue - 1));
+        bool done_waiting_for_track = false;
+        while (!done_waiting_for_track) {
+                bool track_stopped = false;
+                {
+                        std::unique_lock<std::mutex> lock(playbackStateMutex);
+                        playbackStateCv.wait_for(lock, std::chrono::milliseconds(shutdown_wait_timeout_ms), [] {
+                                return activeTrackStopped || interrupt_current_track.load() || shutdown_requested.load();
+                        });
+                        track_stopped = activeTrackStopped;
+                }
+
+                if (track_stopped) {
+                        done_waiting_for_track = true;
                         continue;
                 }
 
-                const bool should_stop_current_playback = interrupt_current_track.exchange(false);
-                if (!should_stop_current_playback) {
-                        SDL_Delay(playback_poll_base_ms + playback_poll_per_queue_item_ms * (queue - 1));
+                if (shutdown_requested.load()) {
+                        if (!stop_requested_for_track) {
+                                MIX_StopTrack(track, 0);
+                        }
+                        done_waiting_for_track = true;
+                        continue;
+                }
+
+                if (stop_requested_for_track) {
+                        continue;
+                }
+
+                if (!interrupt_current_track.exchange(false)) {
                         continue;
                 }
 
@@ -325,7 +369,6 @@ void play_clip(const char * filepath) {
 
                 MIX_StopTrack(track, fade_out_frames);
                 stop_requested_for_track = true;
-                SDL_Delay(playback_poll_base_ms + playback_poll_per_queue_item_ms * (queue - 1));
         }
 
 exit:
@@ -435,6 +478,7 @@ static void queue_stop_sound_job(const char *file_name) {
                 job.clear_interrupt_before_play = true;
                 audioJobs.push_back(job);
         }
+        playbackStateCv.notify_all();
         audioJobCv.notify_one();
 }
 
@@ -489,12 +533,14 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
 
 extern "C" void obs_module_unload(void) {
         obs_frontend_remove_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
+        shutdown_requested = true;
         {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
                 interrupt_current_track = true;
                 audioWorkerRunning = false;
                 audioJobs.clear();
         }
+        playbackStateCv.notify_all();
         audioJobCv.notify_all();
         if (audioWorkerThread.joinable()) {
                 audioWorkerThread.join();
@@ -517,6 +563,7 @@ extern "C" const char * obs_module_description(void) {
 }
 
 extern "C" bool obs_module_load(void) {
+        shutdown_requested = false;
         if (SDL_Init(0) < 0) {
                 blog(LOG_ERROR, "SRBeep2: SDL_Init failed: %s", SDL_GetError());
                 return false;

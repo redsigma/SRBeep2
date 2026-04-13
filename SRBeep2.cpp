@@ -31,8 +31,11 @@ Now: EBK21 chkd13303@gmail.com
 struct RecordStartMuteConfig {
         bool enabled = false;
         bool skip_already_muted_sources = true;
+        bool enable_input_capture_enforcement = false;
         uint32_t max_duration_limit_ms = 0;
         uint32_t audio_fade_on_stop_duration_ms = 0;
+        std::string input_capture_target;
+        std::vector<std::string> input_capture_device_names;
         std::vector<std::string> source_names;
 };
 
@@ -132,6 +135,16 @@ static std::string lowercase_copy(std::string value) {
         return value;
 }
 
+static bool contains_case_insensitive(const std::string &haystack, const std::string &needle) {
+        if (needle.empty()) {
+                return false;
+        }
+
+        std::string lowered_haystack = lowercase_copy(haystack);
+        std::string lowered_needle = lowercase_copy(needle);
+        return lowered_haystack.find(lowered_needle) != std::string::npos;
+}
+
 static bool parse_bool_value(const std::string &value) {
         std::string lowered = lowercase_copy(trim_copy(value));
         return lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on";
@@ -226,6 +239,8 @@ static RecordStartMuteConfig load_record_config() {
                         config.enabled = parse_bool_value(value);
                 } else if (key == "skip_already_muted_sources") {
                         config.skip_already_muted_sources = parse_bool_value(value);
+                } else if (key == "enable_input_capture_enforcement") {
+                        config.enable_input_capture_enforcement = parse_bool_value(value);
                 } else if (key == "max_duration_limit") {
                         uint32_t seconds = parse_nonnegative_u32(value, config.max_duration_limit_ms / 1000, 3600);
                         config.max_duration_limit_ms = seconds * 1000;
@@ -237,6 +252,82 @@ static RecordStartMuteConfig load_record_config() {
         }
 
         return config;
+}
+
+static void enforce_input_capture_device(const RecordStartMuteConfig &config) {
+        if (!config.enable_input_capture_enforcement || config.input_capture_target.empty() || config.input_capture_device_names.empty()) {
+                return;
+        }
+
+        obs_source_t *target_source = obs_get_source_by_name(config.input_capture_target.c_str());
+        if (!target_source) {
+                blog(LOG_WARNING, "SRBeep2: Input capture target '%s' not found.", config.input_capture_target.c_str());
+                return;
+        }
+
+        obs_properties_t *properties = obs_source_properties(target_source);
+        if (!properties) {
+                blog(LOG_WARNING, "SRBeep2: Could not read properties for source '%s'.", config.input_capture_target.c_str());
+                obs_source_release(target_source);
+                return;
+        }
+
+        obs_property_t *device_property = obs_properties_get(properties, "device_id");
+        if (!device_property) {
+                blog(LOG_WARNING, "SRBeep2: Source '%s' does not expose a 'device_id' property.", config.input_capture_target.c_str());
+                obs_properties_destroy(properties);
+                obs_source_release(target_source);
+                return;
+        }
+
+        const size_t item_count = obs_property_list_item_count(device_property);
+        std::string matched_device_id;
+        std::string matched_device_name;
+
+        for (const std::string &candidate_name : config.input_capture_device_names) {
+                for (size_t i = 0; i < item_count; ++i) {
+                        const char *list_name = obs_property_list_item_name(device_property, i);
+                        const char *list_id = obs_property_list_item_string(device_property, i);
+                        if (!list_name || !list_id) {
+                                continue;
+                        }
+
+                        if (!contains_case_insensitive(list_name, candidate_name)) {
+                                continue;
+                        }
+
+                        matched_device_id = list_id;
+                        matched_device_name = list_name;
+                        break;
+                }
+
+                if (!matched_device_id.empty()) {
+                        break;
+                }
+        }
+
+        obs_properties_destroy(properties);
+
+        if (matched_device_id.empty()) {
+                blog(LOG_INFO, "SRBeep2: No matching input capture device found for source '%s'.", config.input_capture_target.c_str());
+                obs_source_release(target_source);
+                return;
+        }
+
+        obs_data_t *settings = obs_source_get_settings(target_source);
+        const char *current_device_id = obs_data_get_string(settings, "device_id");
+        if (!current_device_id) {
+                current_device_id = "";
+        }
+
+        if (matched_device_id != current_device_id) {
+                obs_data_set_string(settings, "device_id", matched_device_id.c_str());
+                obs_source_update(target_source, settings);
+                blog(LOG_INFO, "SRBeep2: Source '%s' device set to '%s'.", config.input_capture_target.c_str(), matched_device_name.c_str());
+        }
+
+        obs_data_release(settings);
+        obs_source_release(target_source);
 }
 
 static std::vector<SourceMuteState> mute_configured_sources(const RecordStartMuteConfig &config) {
@@ -423,6 +514,7 @@ void play_sound(std::string file_name) {
 static void play_record_start_sound_with_optional_source_mute() {
         RecordStartMuteConfig config = load_record_config();
         audio_fade_on_stop_duration_ms = config.audio_fade_on_stop_duration_ms;
+        enforce_input_capture_device(config);
 
         if (!config.enabled || config.source_names.empty()) {
                 play_sound("/record_start_sound.mp3");
@@ -548,7 +640,7 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
         } else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED) {
                 queue_stop_sound_job("/buffer_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_UNPAUSED) {
-                queue_sound_job("/pause_stop_sound.mp3");
+                queue_sound_job("/pause_stop_sound.mp3", true);
         }
 }
 

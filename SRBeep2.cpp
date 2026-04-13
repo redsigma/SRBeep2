@@ -346,10 +346,10 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
                 }
                 bf_sto_Thread = std::thread(play_sound, "/buffer_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_UNPAUSED) {
-                if (ps_stt_Thread.joinable()) {
-                        ps_stt_Thread.join();
+                if (ps_sto_Thread.joinable()) {
+                        ps_sto_Thread.join();
                 }
-                ps_stt_Thread = std::thread(play_sound, "/pause_stop_sound.mp3");
+                ps_sto_Thread = std::thread(play_sound, "/pause_stop_sound.mp3");
         }
 }
 

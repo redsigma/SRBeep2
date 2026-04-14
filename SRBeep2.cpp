@@ -1,6 +1,8 @@
 /***********************************
 Orig: A Docile Sloth adocilesloth@gmail.com
 Now: EBK21 chkd13303@gmail.com
+Modified by: redsigma (2026-04)
+Changes: audio queue/mute logic, input-capture enforcement, audio fading logic
 ************************************/
 
 #include <obs-module.h>

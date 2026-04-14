@@ -115,10 +115,10 @@ static std::u8string to_u8string(const std::string &value) {
         return std::u8string(value.begin(), value.end());
 }
 
-static std::string module_data_file_path(const std::string &relative_path) {
+static std::filesystem::path module_data_file_path(const std::string &relative_path) {
         const char *module_data_path = obs_get_module_data_path(obs_current_module());
         if (!module_data_path) {
-                return relative_path;
+                return std::filesystem::path(to_u8string(relative_path));
         }
 
         std::string cleaned_relative = relative_path;
@@ -128,9 +128,7 @@ static std::string module_data_file_path(const std::string &relative_path) {
 
         std::filesystem::path base_path(to_u8string(module_data_path));
         std::filesystem::path relative(to_u8string(cleaned_relative));
-        std::filesystem::path full_path = (base_path / relative).lexically_normal();
-        std::u8string utf8 = full_path.u8string();
-        return std::string(utf8.begin(), utf8.end());
+        return (base_path / relative).lexically_normal();
 }
 
 static std::string trim_copy(const std::string &value) {
@@ -247,6 +245,17 @@ static std::vector<std::string> parse_sources_csv(const std::string &value) {
         return source_names;
 }
 
+static std::string join_string_list(const std::vector<std::string> &items) {
+        std::stringstream joined;
+        for (size_t i = 0; i < items.size(); ++i) {
+                if (i > 0) {
+                        joined << ", ";
+                }
+                joined << items[i];
+        }
+        return joined.str();
+}
+
 static std::vector<std::string> split_plus_tokens(const std::string &value) {
         std::vector<std::string> tokens;
         std::stringstream parser(value);
@@ -338,7 +347,7 @@ static bool parse_hotkey_combination(const std::string &spec, obs_key_combinatio
 static RecordStartMuteConfig load_record_config() {
         RecordStartMuteConfig config;
 
-        std::string true_path = module_data_file_path("record_config.ini");
+        std::filesystem::path true_path = module_data_file_path("record_config.ini");
 
         std::ifstream file(true_path);
         if (!file.is_open()) {
@@ -417,6 +426,7 @@ static void enforce_input_capture_device(const RecordStartMuteConfig &config) {
         const size_t item_count = obs_property_list_item_count(device_property);
         std::string matched_device_id;
         std::string matched_device_name;
+        std::vector<std::string> available_devices;
 
         for (const std::string &candidate_name : config.input_capture_device_names) {
                 for (size_t i = 0; i < item_count; ++i) {
@@ -440,10 +450,31 @@ static void enforce_input_capture_device(const RecordStartMuteConfig &config) {
                 }
         }
 
+        for (size_t i = 0; i < item_count; ++i) {
+                const char *list_name = obs_property_list_item_name(device_property, i);
+                const char *list_id = obs_property_list_item_string(device_property, i);
+                if (!list_name || !list_id) {
+                        continue;
+                }
+
+                std::stringstream entry;
+                entry << list_name << " [" << list_id << "]";
+                available_devices.push_back(entry.str());
+        }
+
         obs_properties_destroy(properties);
 
         if (matched_device_id.empty()) {
-                blog(LOG_INFO, "SRBeep2: No matching input capture device found for source '%s'.", config.input_capture_target.c_str());
+                std::string requested_list = join_string_list(config.input_capture_device_names);
+                std::string available_list = join_string_list(available_devices);
+
+                blog(
+                        LOG_INFO,
+                        "SRBeep2: No matching input capture device found for source '%s'. Requested: [%s]. Available: [%s].",
+                        config.input_capture_target.c_str(),
+                        requested_list.c_str(),
+                        available_list.c_str()
+                );
                 obs_source_release(target_source);
                 return;
         }
@@ -632,8 +663,10 @@ void play_clip(const char * filepath) {
 }
 
 void play_sound(std::string file_name) {
-        std::string true_path = module_data_file_path(file_name);
-        play_clip(true_path.c_str());
+        std::filesystem::path true_path = module_data_file_path(file_name);
+        std::u8string utf8 = true_path.u8string();
+        std::string utf8_path(utf8.begin(), utf8.end());
+        play_clip(utf8_path.c_str());
 }
 
 static void play_record_start_sound_with_optional_source_mute() {
@@ -889,7 +922,7 @@ static void on_record_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
                 return;
         }
 
-        queue_stop_sound_job("/record_stop_sound.mp3");
+        obs_frontend_recording_stop();
 }
 
 static void on_pause_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed) {

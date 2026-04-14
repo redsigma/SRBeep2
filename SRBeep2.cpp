@@ -20,6 +20,7 @@ Changes: audio queue/mute logic, input-capture enforcement, audio fading logic
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -98,6 +99,8 @@ obs_hotkey_id pause_toggle_hotkey = OBS_INVALID_HOTKEY_ID;
 
 OBS_DECLARE_MODULE()
 
+static bool mode_uses_deferred_hotkeys();
+
 static void SDLCALL on_track_stopped(void *userdata, MIX_Track *stopped_track) {
         unused(userdata);
         unused(stopped_track);
@@ -108,29 +111,26 @@ static void SDLCALL on_track_stopped(void *userdata, MIX_Track *stopped_track) {
         playbackStateCv.notify_all();
 }
 
-std::string clean_path(std::string audio_path) {
-        std::string cleaned_path;
-        if (audio_path.empty()) {
-                return cleaned_path;
+static std::u8string to_u8string(const std::string &value) {
+        return std::u8string(value.begin(), value.end());
+}
+
+static std::string module_data_file_path(const std::string &relative_path) {
+        const char *module_data_path = obs_get_module_data_path(obs_current_module());
+        if (!module_data_path) {
+                return relative_path;
         }
 
-        if (audio_path.find("..") != std::string::npos) {
-                size_t pos = audio_path.find("..");
-                cleaned_path = audio_path.substr(pos);
+        std::string cleaned_relative = relative_path;
+        while (!cleaned_relative.empty() && (cleaned_relative[0] == '/' || cleaned_relative[0] == '\\')) {
+                cleaned_relative.erase(0, 1);
         }
-        else {
-                #ifdef _WIN32
-                while (audio_path.length() > 0 && islower((unsigned char)audio_path[0])) {
-                        audio_path = audio_path.substr(1);
-                }
-                #else
-                while (audio_path.length() > 0 && audio_path.substr(0, 1) != "/") {
-                        audio_path = audio_path.substr(1);
-                }
-                #endif
-                cleaned_path = audio_path;
-        }
-        return cleaned_path;
+
+        std::filesystem::path base_path(to_u8string(module_data_path));
+        std::filesystem::path relative(to_u8string(cleaned_relative));
+        std::filesystem::path full_path = (base_path / relative).lexically_normal();
+        std::u8string utf8 = full_path.u8string();
+        return std::string(utf8.begin(), utf8.end());
 }
 
 static std::string trim_copy(const std::string &value) {
@@ -338,11 +338,7 @@ static bool parse_hotkey_combination(const std::string &spec, obs_key_combinatio
 static RecordStartMuteConfig load_record_config() {
         RecordStartMuteConfig config;
 
-        const char *obs_data_path = obs_get_module_data_path(obs_current_module());
-        std::stringstream config_path;
-        config_path << obs_data_path;
-        config_path << "/record_config.ini";
-        std::string true_path = clean_path(config_path.str());
+        std::string true_path = module_data_file_path("record_config.ini");
 
         std::ifstream file(true_path);
         if (!file.is_open()) {
@@ -541,7 +537,7 @@ void play_clip(const char * filepath) {
         };
         auto fail = [&](int line) {
                 blog(LOG_ERROR, "Failed to play audio! At %s:%d", __FILE__, line);
-                blog(LOG_ERROR, SDL_GetError());
+                blog(LOG_ERROR, "%s", SDL_GetError());
                 cleanup();
         };
 
@@ -636,17 +632,8 @@ void play_clip(const char * filepath) {
 }
 
 void play_sound(std::string file_name) {
-        const char * obs_data_path = obs_get_module_data_path(obs_current_module());
-        std::stringstream audio_path;
-        std::string true_path;
-
-        audio_path << obs_data_path;
-        audio_path << file_name;
-        true_path = clean_path(audio_path.str());
+        std::string true_path = module_data_file_path(file_name);
         play_clip(true_path.c_str());
-        audio_path.str("");
-
-        return;
 }
 
 static void play_record_start_sound_with_optional_source_mute() {
@@ -1019,7 +1006,7 @@ extern "C" bool obs_module_load(void) {
         RecordStartMuteConfig config;
 
         shutdown_requested = false;
-        if (SDL_Init(0) < 0) {
+        if (!SDL_Init(0)) {
                 blog(LOG_ERROR, "SRBeep2: SDL_Init failed: %s", SDL_GetError());
                 return false;
         }

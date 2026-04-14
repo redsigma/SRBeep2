@@ -1,0 +1,15 @@
+changelog:
+  categories:
+    - title: Features
+      labels:
+        - "feature request"
+        - "improvement"
+    - title: Fixes
+      labels:
+        - "fix"
+    - title: Build
+      labels:
+        - "build"
+    - title: Commits
+      labels:
+        - "*"

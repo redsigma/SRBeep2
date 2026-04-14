@@ -1,0 +1,673 @@
+name: Build CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  OBS_VERSION: "32.1.1"
+  LLVM_VERSION: "21.1.6"
+  SDL3_VERSION: "3.4.0"
+  SDL3_MIXER_VERSION: "3.2.0"
+  CLANG_FORMAT_VERSION: "20.1.0"
+
+jobs:
+  lint-clang-format:
+    name: Lint (clang-format)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install clang-format
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user pipx
+          pipx install --global "clang-format==${CLANG_FORMAT_VERSION}"
+          clang-format --version
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang-format -i SRBeep2.cpp
+          if ! git diff --exit-code; then
+            echo "clang-format produced changes. Please format SRBeep2.cpp and commit."
+            git --no-pager diff
+            exit 1
+          fi
+
+  build-windows:
+    name: Build Windows x64
+    needs: [lint-clang-format]
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize architecture label
+        id: arch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $normalized = '${{ runner.arch }}'.ToLowerInvariant()
+          "value=$normalized" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download llvm-mingw
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvmVersion = '${{ env.LLVM_VERSION }}'
+
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $escapedVersion = [regex]::Escape($llvmVersion)
+
+          $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/mstorsjo/llvm-mingw/releases?per_page=100'
+          $matchingRelease = $releases | Where-Object {
+            $body = [string]$_.body
+            $name = [string]$_.name
+            ($body -match "(?i)\bLLVM\s+$escapedVersion\b") -or
+            ($name -match "(?i)\bLLVM\s+$escapedVersion\b")
+          } | Select-Object -First 1
+
+          if (-not $matchingRelease) {
+            throw "Could not find an llvm-mingw release that references LLVM $llvmVersion."
+          }
+
+          $mingwRelease = [string]$matchingRelease.tag_name
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$mingwRelease/llvm-mingw-$mingwRelease-ucrt-x86_64.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile 'llvm-mingw.zip'
+          Expand-Archive -Path 'llvm-mingw.zip' -DestinationPath 'toolchain' -Force
+
+          $llvmRoot = (Get-ChildItem 'toolchain' -Directory | Select-Object -First 1).FullName
+          "LLVM_ROOT=$llvmRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Download OBS source
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $obsVersion = '${{ env.OBS_VERSION }}'
+          $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/obsproject/obs-studio/releases/tags/$obsVersion"
+          $asset = $release.assets | Where-Object {
+            $_.name -match 'Windows-x64\.zip$' -and $_.name -notmatch 'PDBs'
+          } | Select-Object -First 1
+
+          if (-not $asset) {
+            $assetNames = ($release.assets | ForEach-Object { $_.name }) -join ', '
+            throw "Could not find a Windows x64 zip asset in OBS release $obsVersion. Assets: $assetNames"
+          }
+
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile 'obs-windows.zip'
+          Expand-Archive -Path 'obs-windows.zip' -DestinationPath 'obs-runtime' -Force
+
+          git clone --depth 1 --branch $obsVersion https://github.com/obsproject/obs-studio.git obs-studio-src
+          "OBS_TAG=$obsVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure OBS (generate headers)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          cmake -S 'obs-studio-src' -B 'obs-build' -G "Visual Studio 17 2022" -A x64 `
+            -DENABLE_UI=OFF `
+            -DENABLE_FRONTEND=OFF `
+            -DENABLE_SCRIPTING=OFF `
+            -DENABLE_PLUGINS=OFF `
+            -DENABLE_UNIT_TESTS=OFF `
+            -DBUILD_BROWSER=OFF `
+            -DBUILD_CAPTIONS=OFF
+
+          $generatedObsConfig = Get-ChildItem -Path 'obs-build' -Recurse -Filter 'obsconfig.h' | Select-Object -First 1
+          if (-not $generatedObsConfig) {
+            throw 'obsconfig.h was not generated by OBS configure step.'
+          }
+
+          $generatedIncludeDir = Split-Path -Parent $generatedObsConfig.FullName
+          "OBS_GENERATED_INCLUDE=$generatedIncludeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Download SDL3 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ env.SDL3_VERSION }}'
+          $url = "https://github.com/libsdl-org/SDL/archive/refs/tags/release-$version.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile 'sdl3-src.zip'
+          Expand-Archive -Path 'sdl3-src.zip' -DestinationPath 'sdl3-src' -Force
+
+      - name: Build and install SDL3 static
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvmRoot = $env:LLVM_ROOT
+          $cc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang.exe')).Path -replace '\\', '/'
+          $cxx = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang++.exe')).Path -replace '\\', '/'
+          $rc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-windres.exe')).Path -replace '\\', '/'
+          $sdlSource = (Get-ChildItem 'sdl3-src' -Directory | Select-Object -First 1).FullName
+          $sdlInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-install'
+
+          cmake -S $sdlSource -B 'sdl3-build' -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$cc" `
+            -DCMAKE_CXX_COMPILER="$cxx" `
+            -DCMAKE_RC_COMPILER="$rc" `
+            -DCMAKE_INSTALL_PREFIX="$sdlInstall" `
+            -DSDL_SHARED=OFF `
+            -DSDL_STATIC=ON `
+            -DSDL_TEST=OFF `
+            -DSDL_TEST_LIBRARY=OFF
+
+          cmake --build 'sdl3-build' --config Release
+          cmake --install 'sdl3-build' --config Release
+
+      - name: Download SDL3_mixer source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ env.SDL3_MIXER_VERSION }}'
+          $url = "https://github.com/libsdl-org/SDL_mixer/archive/refs/tags/release-$version.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile 'sdl3-mixer-src.zip'
+          Expand-Archive -Path 'sdl3-mixer-src.zip' -DestinationPath 'sdl3-mixer-src' -Force
+
+      - name: Build and install SDL3_mixer static
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $llvmRoot = $env:LLVM_ROOT
+          $cc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang.exe')).Path -replace '\\', '/'
+          $cxx = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-clang++.exe')).Path -replace '\\', '/'
+          $rc = (Resolve-Path (Join-Path $llvmRoot 'bin\x86_64-w64-mingw32-windres.exe')).Path -replace '\\', '/'
+          $sdlMixerSource = (Get-ChildItem 'sdl3-mixer-src' -Directory | Select-Object -First 1).FullName
+          $sdlInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-install'
+          $sdlMixerInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-mixer-install'
+
+          cmake -S $sdlMixerSource -B 'sdl3-mixer-build' -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$cc" `
+            -DCMAKE_CXX_COMPILER="$cxx" `
+            -DCMAKE_RC_COMPILER="$rc" `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DCMAKE_PREFIX_PATH="$sdlInstall" `
+            -DCMAKE_INSTALL_PREFIX="$sdlMixerInstall" `
+            -DSDL3MIXER_VENDORED=ON `
+            -DSDL3MIXER_DEPS_SHARED=OFF `
+            -DSDL3MIXER_SAMPLES=OFF `
+            -DSDL3MIXER_STATIC=ON `
+            -DSDL3MIXER_SHARED=OFF
+
+          cmake --build 'sdl3-mixer-build' --config Release
+          cmake --install 'sdl3-mixer-build' --config Release
+
+      - name: Compile (Windows/Clang)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $llvmRoot = $env:LLVM_ROOT
+          $clang = Join-Path $llvmRoot 'bin\clang++.exe'
+
+          $sdlInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-install'
+          $sdlInclude = Join-Path $sdlInstall 'include'
+          $sdlLib = Join-Path $sdlInstall 'lib'
+
+          $sdlMixerInstall = Join-Path $env:GITHUB_WORKSPACE 'sdl3-mixer-install'
+          $sdlMixerInclude = Join-Path $sdlMixerInstall 'include'
+          $sdlMixerLib = Join-Path $sdlMixerInstall 'lib'
+
+          $sdlStatic = Join-Path $sdlLib 'libSDL3.a'
+          $sdlMixerStatic = Join-Path $sdlMixerLib 'libSDL3_mixer.a'
+
+          $obsSrc = Join-Path $env:GITHUB_WORKSPACE 'obs-studio-src'
+          $obsBin = Join-Path $env:GITHUB_WORKSPACE 'obs-runtime\bin\64bit'
+          $obsGeneratedInclude = $env:OBS_GENERATED_INCLUDE
+
+          $requiredPaths = @(
+            $clang,
+            (Join-Path $obsSrc 'libobs'),
+            (Join-Path $obsSrc 'frontend\api'),
+            (Join-Path $obsGeneratedInclude 'obsconfig.h'),
+            (Join-Path $obsBin 'obs.dll'),
+            (Join-Path $obsBin 'obs-frontend-api.dll'),
+            (Join-Path $sdlInclude 'SDL3\SDL.h'),
+            (Join-Path $sdlMixerInclude 'SDL3_mixer\SDL_mixer.h')
+          )
+
+          foreach ($path in $requiredPaths) {
+            if (-not (Test-Path $path)) {
+              throw "Required path not found: $path"
+            }
+          }
+
+          Write-Host "SDL lib directory: $sdlLib"
+          Get-ChildItem -Path $sdlLib -Filter '*.a' -File | ForEach-Object { Write-Host "SDL archive: $($_.Name)" }
+          Write-Host "SDL_mixer lib directory: $sdlMixerLib"
+          Get-ChildItem -Path $sdlMixerLib -Filter '*.a' -File | ForEach-Object { Write-Host "SDL_mixer archive: $($_.Name)" }
+
+          if (-not (Test-Path $sdlStatic)) {
+            throw "Static SDL3 library required but not found: $sdlStatic"
+          }
+          if (-not (Test-Path $sdlMixerStatic)) {
+            throw "Static SDL3_mixer library required but not found: $sdlMixerStatic"
+          }
+
+          $args = @(
+            '--target=x86_64-w64-windows-gnu',
+            '-std=c++20',
+            '-flto',
+            '-Oz',
+            '-static-libgcc',
+            '-static-libstdc++',
+            "-I$obsSrc\libobs",
+            "-I$obsSrc\frontend\api",
+            "-I$obsGeneratedInclude",
+            "-I$sdlInclude",
+            "-I$sdlMixerInclude",
+            "-L$sdlLib",
+            "-L$sdlMixerLib",
+            "-L$obsBin",
+            'SRBeep2.cpp',
+            "$obsBin\obs.dll",
+            "$obsBin\obs-frontend-api.dll"
+          )
+
+          $sdlLinkArgs = @(
+            '-Wl,-Bstatic',
+            $sdlMixerStatic,
+            $sdlStatic,
+            '-Wl,-Bdynamic'
+          )
+
+          $tailArgs = @(
+            '-lversion',
+            '-lshell32',
+            '-lwinmm',
+            '-limm32',
+            '-lole32',
+            '-lgdi32',
+            '-lcfgmgr32',
+            '-lsetupapi',
+            '-loleaut32',
+            '-luuid',
+            '-municode',
+            '-mwindows',
+            '-shared',
+            'srbeep2.def',
+            '-o',
+            'srbeep2.dll'
+          )
+
+          $args += $sdlLinkArgs
+          $args += $tailArgs
+
+          & $clang @args
+          if ($LASTEXITCODE -ne 0) {
+            throw "Compilation failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          New-Item -ItemType Directory -Force 'dist\obs-plugins\64bit' | Out-Null
+          New-Item -ItemType Directory -Force 'dist\data\obs-plugins\srbeep2' | Out-Null
+
+          Copy-Item 'srbeep2.dll' 'dist\obs-plugins\64bit\srbeep2.dll' -Force
+          Copy-Item 'resource\*' 'dist\data\obs-plugins\srbeep2\' -Recurse -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: srbeep2-windows-${{ steps.arch.outputs.value }}-${{ env.OBS_VERSION }}
+          path: dist
+          retention-days: 14
+
+  build-linux:
+    name: Build Linux x64
+    needs: [lint-clang-format]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize architecture label
+        id: arch
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "value=$(echo '${{ runner.arch }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          XCB_XINPUT_DEV="libxcb-xinput-dev"
+          if ! apt-cache show "${XCB_XINPUT_DEV}" >/dev/null 2>&1; then
+            XCB_XINPUT_DEV="libxcb-xinput0-dev"
+          fi
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            extra-cmake-modules \
+            git \
+            uthash-dev \
+            libjansson-dev \
+            uuid-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libsimde-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            "${XCB_XINPUT_DEV}" \
+            libxext-dev \
+            libxrandr-dev \
+            libxfixes-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxss-dev \
+            libxtst-dev \
+            libxkbcommon-x11-dev \
+            libxkbcommon-dev \
+            libglib2.0-dev \
+            libglib2.0-dev-bin \
+            libpulse-dev \
+            libgl1-mesa-dev \
+            libopengl-dev \
+            libdrm-dev \
+            libcurl4-openssl-dev \
+            ninja-build \
+            pkg-config \
+            curl \
+            unzip \
+            xz-utils \
+            zip
+
+      - name: Download llvm
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+          curl -L --progress-bar "${LLVM_URL}" -o llvm-linux.tar.xz
+          mkdir -p toolchain
+          tar -xf llvm-linux.tar.xz -C toolchain --checkpoint=200 --checkpoint-action=dot
+          echo
+          LLVM_ROOT_REL="$(find toolchain -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          if [[ -z "${LLVM_ROOT_REL}" || ! -x "${LLVM_ROOT_REL}/bin/clang++" ]]; then
+            echo "Pinned LLVM toolchain extraction failed."
+            exit 1
+          fi
+          LLVM_ROOT="$(cd "${LLVM_ROOT_REL}" && pwd)"
+          echo "LLVM_ROOT=${LLVM_ROOT}" >> "$GITHUB_ENV"
+          echo "${LLVM_ROOT}/bin" >> "$GITHUB_PATH"
+
+      - name: Download OBS source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${OBS_VERSION}" https://github.com/obsproject/obs-studio.git obs-studio-src
+
+      - name: Configure OBS (generate headers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLANG_C="${LLVM_ROOT}/bin/clang"
+          CLANG_CXX="${LLVM_ROOT}/bin/clang++"
+          cmake -S obs-studio-src -B obs-build \
+            -DCMAKE_C_COMPILER="${CLANG_C}" \
+            -DCMAKE_CXX_COMPILER="${CLANG_CXX}" \
+            -DENABLE_UI=OFF \
+            -DENABLE_FRONTEND=OFF \
+            -DENABLE_WAYLAND=OFF \
+            -DENABLE_SCRIPTING=OFF \
+            -DENABLE_PLUGINS=OFF \
+            -DENABLE_UNIT_TESTS=OFF \
+            -DBUILD_BROWSER=OFF \
+            -DBUILD_CAPTIONS=OFF
+
+          OBS_GENERATED_INCLUDE="$(dirname "$(find obs-build -name obsconfig.h | head -n 1)")"
+          if [[ -z "${OBS_GENERATED_INCLUDE}" || ! -f "${OBS_GENERATED_INCLUDE}/obsconfig.h" ]]; then
+            echo "obsconfig.h was not generated by OBS configure step."
+            exit 1
+          fi
+          echo "OBS_GENERATED_INCLUDE=${OBS_GENERATED_INCLUDE}" >> "$GITHUB_ENV"
+
+      - name: Download SDL3 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --progress-bar "https://github.com/libsdl-org/SDL/archive/refs/tags/release-${SDL3_VERSION}.zip" -o sdl3-src.zip
+          unzip -q sdl3-src.zip -d sdl3-src
+
+      - name: Build and install SDL3 static
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDL_SOURCE="$(find sdl3-src -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          SDL_INSTALL="${GITHUB_WORKSPACE}/sdl3-install"
+          CLANG_C="${LLVM_ROOT}/bin/clang"
+          CLANG_CXX="${LLVM_ROOT}/bin/clang++"
+          cmake -S "${SDL_SOURCE}" -B sdl3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="${CLANG_C}" \
+            -DCMAKE_CXX_COMPILER="${CLANG_CXX}" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_INSTALL_PREFIX="${SDL_INSTALL}" \
+            -DSDL_SHARED=OFF \
+            -DSDL_STATIC=ON \
+            -DSDL_TEST=OFF \
+            -DSDL_TEST_LIBRARY=OFF
+          cmake --build sdl3-build --config Release
+          cmake --install sdl3-build --config Release
+
+      - name: Download SDL3_mixer source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --progress-bar "https://github.com/libsdl-org/SDL_mixer/archive/refs/tags/release-${SDL3_MIXER_VERSION}.zip" -o sdl3-mixer-src.zip
+          unzip -q sdl3-mixer-src.zip -d sdl3-mixer-src
+
+      - name: Build and install SDL3_mixer static
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDL_MIXER_SOURCE="$(find sdl3-mixer-src -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          SDL_INSTALL="${GITHUB_WORKSPACE}/sdl3-install"
+          SDL_MIXER_INSTALL="${GITHUB_WORKSPACE}/sdl3-mixer-install"
+          CLANG_C="${LLVM_ROOT}/bin/clang"
+          CLANG_CXX="${LLVM_ROOT}/bin/clang++"
+          cmake -S "${SDL_MIXER_SOURCE}" -B sdl3-mixer-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="${CLANG_C}" \
+            -DCMAKE_CXX_COMPILER="${CLANG_CXX}" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_PREFIX_PATH="${SDL_INSTALL}" \
+            -DCMAKE_INSTALL_PREFIX="${SDL_MIXER_INSTALL}" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DSDL3MIXER_VENDORED=ON \
+            -DSDL3MIXER_DEPS_SHARED=OFF \
+            -DSDL3MIXER_SAMPLES=OFF \
+            -DSDL3MIXER_STATIC=ON \
+            -DSDL3MIXER_SHARED=OFF
+          cmake --build sdl3-mixer-build --config Release
+          cmake --install sdl3-mixer-build --config Release
+
+      - name: Compile (Linux/Clang)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDL_INSTALL="${GITHUB_WORKSPACE}/sdl3-install"
+          SDL_MIXER_INSTALL="${GITHUB_WORKSPACE}/sdl3-mixer-install"
+          SDL_LIB="${SDL_INSTALL}/lib"
+          SDL_MIXER_LIB="${SDL_MIXER_INSTALL}/lib"
+          SDL_STATIC="${SDL_INSTALL}/lib/libSDL3.a"
+          SDL_MIXER_STATIC="${SDL_MIXER_INSTALL}/lib/libSDL3_mixer.a"
+          CLANGXX="${LLVM_ROOT}/bin/clang++"
+          LLD="${LLVM_ROOT}/bin/ld.lld"
+
+          test -f "${OBS_GENERATED_INCLUDE}/obsconfig.h"
+          test -f "${SDL_INSTALL}/include/SDL3/SDL.h"
+          test -f "${SDL_MIXER_INSTALL}/include/SDL3_mixer/SDL_mixer.h"
+          test -x "${CLANGXX}"
+          test -x "${LLD}"
+
+          echo "SDL lib directory: ${SDL_LIB}"
+          find "${SDL_LIB}" -maxdepth 1 -type f -name '*.a' -printf 'SDL archive: %f\n' || true
+          echo "SDL_mixer lib directory: ${SDL_MIXER_LIB}"
+          find "${SDL_MIXER_LIB}" -maxdepth 1 -type f -name '*.a' -printf 'SDL_mixer archive: %f\n' || true
+
+          if [[ ! -f "${SDL_STATIC}" ]]; then
+            echo "Static SDL3 library required but not found: ${SDL_STATIC}"
+            exit 1
+          fi
+          if [[ ! -f "${SDL_MIXER_STATIC}" ]]; then
+            echo "Static SDL3_mixer library required but not found: ${SDL_MIXER_STATIC}"
+            exit 1
+          fi
+
+          "${CLANGXX}" \
+            -std=c++20 \
+            -fPIC \
+            -flto \
+            -fuse-ld=lld \
+            -Oz \
+            -I"${GITHUB_WORKSPACE}/obs-studio-src/libobs" \
+            -I"${GITHUB_WORKSPACE}/obs-studio-src/frontend/api" \
+            -I"${OBS_GENERATED_INCLUDE}" \
+            -I"${SDL_INSTALL}/include" \
+            -I"${SDL_MIXER_INSTALL}/include" \
+            -L"${SDL_INSTALL}/lib" \
+            -L"${SDL_MIXER_INSTALL}/lib" \
+            SRBeep2.cpp \
+            -Wl,-Bstatic \
+            "${SDL_MIXER_STATIC}" \
+            "${SDL_STATIC}" \
+            -Wl,-Bdynamic \
+            -pthread \
+            -ldl \
+            -lm \
+            -shared \
+            -o srbeep2.so
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/obs-plugins/64bit
+          mkdir -p dist/data/obs-plugins/srbeep2
+          cp srbeep2.so dist/obs-plugins/64bit/srbeep2.so
+          cp -r resource/* dist/data/obs-plugins/srbeep2/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: srbeep2-linux-${{ steps.arch.outputs.value }}-${{ env.OBS_VERSION }}
+          path: dist
+          retention-days: 14
+
+  release-artifacts:
+    name: Release Bundle Artifact
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-artifacts
+
+      - name: Upload bundled release artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: srbeep2-release-bundle-${{ github.ref_name }}
+          path: release-artifacts
+          retention-days: 30
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for d in release-assets/*; do
+            name="$(basename "$d")"
+            (cd "$d" && zip -r "../../${name}.zip" .)
+          done
+          ls -lah *.zip
+
+      - name: Publish release page
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=( ./*.zip )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No release archives found."
+            exit 1
+          fi
+
+          tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+          if gh release view "${tag}" -R "${repo}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${files[@]}" -R "${repo}" --clobber
+          else
+            gh release create "${tag}" "${files[@]}" -R "${repo}" --generate-notes
+          fi

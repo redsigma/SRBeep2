@@ -63,6 +63,8 @@ struct SoundJob {
         bool apply_record_start_mute = false;
         bool clear_interrupt_before_play = false;
         DeferredAction deferred_action = DeferredAction::None;
+        uint64_t deferred_start_pending_action_id = 0;
+        uint64_t deferred_unpause_pending_action_id = 0;
 };
 
 std::mutex audioMutex;
@@ -77,7 +79,11 @@ std::deque<SoundJob> audioJobs;
 std::atomic_bool interrupt_current_track = false;
 std::atomic_uint32_t audio_fade_on_stop_duration_ms = 0;
 std::atomic_bool shutdown_requested = false;
-std::atomic_bool deferred_start_pending = false;
+std::atomic_uint64_t deferred_start_pending_action_id_counter = 0;
+std::atomic_uint64_t deferred_start_active_pending_action_id = 0;
+std::atomic_uint64_t deferred_unpause_pending_action_id_counter = 0;
+std::atomic_uint64_t deferred_unpause_active_pending_action_id = 0;
+std::atomic_bool deferred_start_commit_in_progress = false;
 
 std::mutex playbackStateMutex;
 std::condition_variable playbackStateCv;
@@ -266,6 +272,8 @@ static obs_key_t parse_hotkey_main_key_token(const std::string &token) {
 
         if (upper == "ESC") {
                 upper = "ESCAPE";
+        } else if (upper == "ENTER") {
+                upper = "RETURN";
         } else if (upper == "DEL") {
                 upper = "DELETE";
         } else if (upper == "INS") {
@@ -338,7 +346,7 @@ static RecordStartMuteConfig load_record_config() {
 
         std::ifstream file(true_path);
         if (!file.is_open()) {
-                blog(LOG_INFO, "SRBeep2: record_config.ini not found. Source muting is disabled.");
+                blog(LOG_INFO, "SRBeep2: record_config.ini not found. Mode 0 (all beeps off) is active.");
                 return config;
         }
 
@@ -715,11 +723,18 @@ static void queue_deferred_sound_job(const char *file_name, bool apply_record_st
                         job.file_name = file_name;
                 }
                 job.apply_record_start_mute = apply_record_start_mute;
+                job.clear_interrupt_before_play = true;
                 job.deferred_action = deferred_action;
+                if (deferred_action == SoundJob::DeferredAction::StartRecording) {
+                        const uint64_t token = deferred_start_pending_action_id_counter.fetch_add(1) + 1;
+                        job.deferred_start_pending_action_id = token;
+                        deferred_start_active_pending_action_id = token;
+                } else if (deferred_action == SoundJob::DeferredAction::UnpauseRecording) {
+                        const uint64_t token = deferred_unpause_pending_action_id_counter.fetch_add(1) + 1;
+                        job.deferred_unpause_pending_action_id = token;
+                        deferred_unpause_active_pending_action_id = token;
+                }
                 audioJobs.push_back(job);
-        }
-        if (deferred_action == SoundJob::DeferredAction::StartRecording) {
-                deferred_start_pending = true;
         }
         audioJobCv.notify_one();
 }
@@ -728,6 +743,9 @@ static void queue_stop_sound_job(const char *file_name) {
         {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
                 interrupt_current_track = true;
+                deferred_start_active_pending_action_id = 0;
+                deferred_unpause_active_pending_action_id = 0;
+                deferred_start_commit_in_progress = false;
                 audioJobs.clear();
 
                 SoundJob job;
@@ -774,10 +792,41 @@ static void audio_worker_loop() {
                 }
 
                 if (job.deferred_action == SoundJob::DeferredAction::StartRecording) {
-                        if (deferred_start_pending.exchange(false) && !obs_frontend_recording_active()) {
+                        deferred_start_commit_in_progress = true;
+
+                        if (!mode_uses_deferred_hotkeys()) {
+                                uint64_t expected = job.deferred_start_pending_action_id;
+                                if (expected != 0) {
+                                        deferred_start_active_pending_action_id.compare_exchange_strong(expected, 0);
+                                }
+                                deferred_start_commit_in_progress = false;
+                                continue;
+                        }
+
+                        uint64_t expected = job.deferred_start_pending_action_id;
+                        if (expected == 0 || !deferred_start_active_pending_action_id.compare_exchange_strong(expected, 0)) {
+                                deferred_start_commit_in_progress = false;
+                                continue;
+                        }
+
+                        if (!obs_frontend_recording_active()) {
                                 obs_frontend_recording_start();
                         }
+                        deferred_start_commit_in_progress = false;
                 } else if (job.deferred_action == SoundJob::DeferredAction::UnpauseRecording) {
+                        if (!mode_uses_deferred_hotkeys()) {
+                                uint64_t expected = job.deferred_unpause_pending_action_id;
+                                if (expected != 0) {
+                                        deferred_unpause_active_pending_action_id.compare_exchange_strong(expected, 0);
+                                }
+                                continue;
+                        }
+
+                        uint64_t expected = job.deferred_unpause_pending_action_id;
+                        if (expected == 0 || !deferred_unpause_active_pending_action_id.compare_exchange_strong(expected, 0)) {
+                                continue;
+                        }
+
                         if (obs_frontend_recording_active() && obs_frontend_recording_paused()) {
                                 obs_frontend_recording_pause(false);
                         }
@@ -834,15 +883,18 @@ static void on_record_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
         }
 
         if (!obs_frontend_recording_active()) {
-                if (deferred_start_pending.load()) {
+                if (deferred_start_active_pending_action_id.load() != 0) {
                         {
                                 std::lock_guard<std::mutex> lock(audioJobMutex);
-                                deferred_start_pending = false;
+                                deferred_start_active_pending_action_id = 0;
                                 interrupt_current_track = true;
                                 audioJobs.clear();
                         }
                         playbackStateCv.notify_all();
                         audioJobCv.notify_all();
+                        return;
+                }
+                if (deferred_start_commit_in_progress.load()) {
                         return;
                 }
 
@@ -867,6 +919,17 @@ static void on_pause_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *h
         }
 
         if (obs_frontend_recording_paused()) {
+                if (deferred_unpause_active_pending_action_id.load() != 0) {
+                        {
+                                std::lock_guard<std::mutex> lock(audioJobMutex);
+                                deferred_unpause_active_pending_action_id = 0;
+                                interrupt_current_track = true;
+                                audioJobs.clear();
+                        }
+                        playbackStateCv.notify_all();
+                        audioJobCv.notify_all();
+                        return;
+                }
                 queue_deferred_sound_job("/pause_stop_sound.mp3", true, SoundJob::DeferredAction::UnpauseRecording);
                 return;
         }
@@ -921,7 +984,9 @@ extern "C" void obs_module_unload(void) {
                 pause_toggle_hotkey = OBS_INVALID_HOTKEY_ID;
         }
         shutdown_requested = true;
-        deferred_start_pending = false;
+        deferred_start_active_pending_action_id = 0;
+        deferred_unpause_active_pending_action_id = 0;
+        deferred_start_commit_in_progress = false;
         {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
                 interrupt_current_track = true;
@@ -991,4 +1056,5 @@ extern "C" bool obs_module_load(void) {
         obs_frontend_add_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
         return true;
 }
+
 

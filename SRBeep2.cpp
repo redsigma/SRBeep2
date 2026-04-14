@@ -31,13 +31,15 @@ Changes: audio queue/mute logic, input-capture enforcement, audio fading logic
 
 
 struct RecordStartMuteConfig {
-        bool enabled = false;
+        uint32_t enabled_mode = 0;
         bool skip_already_muted_sources = true;
         bool enable_input_capture_enforcement = false;
         uint32_t max_duration_limit_ms = 0;
         uint32_t audio_fade_on_stop_duration_ms = 0;
         std::string input_capture_target;
         std::vector<std::string> input_capture_device_names;
+        std::string record_toggle_hotkey_fallback;
+        std::string pause_toggle_hotkey_fallback;
         std::vector<std::string> source_names;
 };
 
@@ -51,9 +53,16 @@ static constexpr uint32_t max_duration_poll_step_ms = 20;
 static constexpr uint32_t shutdown_wait_timeout_ms = 2000;
 
 struct SoundJob {
+        enum class DeferredAction {
+                None,
+                StartRecording,
+                UnpauseRecording,
+        };
+
         std::string file_name;
         bool apply_record_start_mute = false;
         bool clear_interrupt_before_play = false;
+        DeferredAction deferred_action = DeferredAction::None;
 };
 
 std::mutex audioMutex;
@@ -76,6 +85,9 @@ bool activeTrackStopped = false;
 MIX_Mixer* sdlmixer = NULL;
 thread_local MIX_Audio* audio = NULL;
 thread_local MIX_Track* track = NULL;
+
+obs_hotkey_id record_toggle_hotkey = OBS_INVALID_HOTKEY_ID;
+obs_hotkey_id pause_toggle_hotkey = OBS_INVALID_HOTKEY_ID;
 
 OBS_DECLARE_MODULE()
 
@@ -172,6 +184,27 @@ static uint32_t parse_nonnegative_u32(const std::string &value, uint32_t fallbac
         }
 }
 
+static uint32_t parse_enabled_mode(const std::string &value, uint32_t fallback_mode) {
+        std::string trimmed = trim_copy(value);
+        if (trimmed.empty()) {
+                return fallback_mode;
+        }
+
+        std::string lowered = lowercase_copy(trimmed);
+        if (lowered == "true" || lowered == "yes" || lowered == "on") {
+                return 1;
+        }
+        if (lowered == "false" || lowered == "no" || lowered == "off") {
+                return 0;
+        }
+
+        uint32_t parsed = parse_nonnegative_u32(trimmed, fallback_mode, 2);
+        if (parsed > 2) {
+                return fallback_mode;
+        }
+        return parsed;
+}
+
 static uint32_t parse_seconds_to_ms(const std::string &value, uint32_t fallback_ms) {
         std::string trimmed = trim_copy(value);
         if (trimmed.empty()) {
@@ -207,6 +240,92 @@ static std::vector<std::string> parse_sources_csv(const std::string &value) {
         return source_names;
 }
 
+static std::vector<std::string> split_plus_tokens(const std::string &value) {
+        std::vector<std::string> tokens;
+        std::stringstream parser(value);
+        std::string token;
+
+        while (std::getline(parser, token, '+')) {
+                std::string cleaned = trim_copy(token);
+                if (!cleaned.empty()) {
+                        tokens.push_back(cleaned);
+                }
+        }
+
+        return tokens;
+}
+
+static obs_key_t parse_hotkey_main_key_token(const std::string &token) {
+        if (token.empty()) {
+                return OBS_KEY_NONE;
+        }
+
+        std::string upper = token;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return (char)std::toupper(c); });
+
+        if (upper == "ESC") {
+                upper = "ESCAPE";
+        } else if (upper == "DEL") {
+                upper = "DELETE";
+        } else if (upper == "INS") {
+                upper = "INSERT";
+        } else if (upper == "PGUP") {
+                upper = "PAGEUP";
+        } else if (upper == "PGDN") {
+                upper = "PAGEDOWN";
+        }
+
+        if (upper.rfind("OBS_KEY_", 0) == 0) {
+                return obs_key_from_name(upper.c_str());
+        }
+
+        std::string prefixed = "OBS_KEY_" + upper;
+        return obs_key_from_name(prefixed.c_str());
+}
+
+static bool parse_hotkey_combination(const std::string &spec, obs_key_combination_t &combo_out) {
+        combo_out.modifiers = 0;
+        combo_out.key = OBS_KEY_NONE;
+
+        std::vector<std::string> tokens = split_plus_tokens(spec);
+        if (tokens.empty()) {
+                return false;
+        }
+
+        bool found_main_key = false;
+        for (const std::string &token : tokens) {
+                std::string lowered = lowercase_copy(token);
+                if (lowered == "ctrl" || lowered == "control") {
+                        combo_out.modifiers |= INTERACT_CONTROL_KEY;
+                        continue;
+                }
+                if (lowered == "alt") {
+                        combo_out.modifiers |= INTERACT_ALT_KEY;
+                        continue;
+                }
+                if (lowered == "shift") {
+                        combo_out.modifiers |= INTERACT_SHIFT_KEY;
+                        continue;
+                }
+                if (lowered == "win" || lowered == "windows" || lowered == "meta" || lowered == "command" || lowered == "cmd") {
+                        combo_out.modifiers |= INTERACT_COMMAND_KEY;
+                        continue;
+                }
+
+                if (found_main_key) {
+                        return false;
+                }
+
+                combo_out.key = parse_hotkey_main_key_token(token);
+                if (combo_out.key == OBS_KEY_NONE) {
+                        return false;
+                }
+                found_main_key = true;
+        }
+
+        return found_main_key;
+}
+
 static RecordStartMuteConfig load_record_config() {
         RecordStartMuteConfig config;
 
@@ -237,8 +356,8 @@ static RecordStartMuteConfig load_record_config() {
                 std::string key = lowercase_copy(trim_copy(cleaned.substr(0, separator)));
                 std::string value = trim_copy(cleaned.substr(separator + 1));
 
-                if (key == "enabled") {
-                        config.enabled = parse_bool_value(value);
+                if (key == "record_beep_mode") {
+                        config.enabled_mode = parse_enabled_mode(value, config.enabled_mode);
                 } else if (key == "skip_already_muted_sources") {
                         config.skip_already_muted_sources = parse_bool_value(value);
                 } else if (key == "enable_input_capture_enforcement") {
@@ -248,6 +367,14 @@ static RecordStartMuteConfig load_record_config() {
                         config.max_duration_limit_ms = seconds * 1000;
                 } else if (key == "audio_fade_on_stop_duration") {
                         config.audio_fade_on_stop_duration_ms = parse_seconds_to_ms(value, config.audio_fade_on_stop_duration_ms);
+                } else if (key == "input_capture_target") {
+                        config.input_capture_target = value;
+                } else if (key == "input_capture_device") {
+                        config.input_capture_device_names = parse_sources_csv(value);
+                } else if (key == "record_toggle_hotkey_fallback") {
+                        config.record_toggle_hotkey_fallback = value;
+                } else if (key == "pause_toggle_hotkey_fallback") {
+                        config.pause_toggle_hotkey_fallback = value;
                 } else if (key == "sources") {
                         config.source_names = parse_sources_csv(value);
                 }
@@ -518,7 +645,7 @@ static void play_record_start_sound_with_optional_source_mute() {
         audio_fade_on_stop_duration_ms = config.audio_fade_on_stop_duration_ms;
         enforce_input_capture_device(config);
 
-        if (!config.enabled || config.source_names.empty()) {
+        if (config.enabled_mode != 1 || config.source_names.empty()) {
                 play_sound("/record_start_sound.mp3");
                 return;
         }
@@ -579,6 +706,20 @@ static void queue_sound_job(const char *file_name, bool apply_record_start_mute 
         audioJobCv.notify_one();
 }
 
+static void queue_deferred_sound_job(const char *file_name, bool apply_record_start_mute, SoundJob::DeferredAction deferred_action) {
+        {
+                std::lock_guard<std::mutex> lock(audioJobMutex);
+                SoundJob job;
+                if (file_name != NULL) {
+                        job.file_name = file_name;
+                }
+                job.apply_record_start_mute = apply_record_start_mute;
+                job.deferred_action = deferred_action;
+                audioJobs.push_back(job);
+        }
+        audioJobCv.notify_one();
+}
+
 static void queue_stop_sound_job(const char *file_name) {
         {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
@@ -623,14 +764,119 @@ static void audio_worker_loop() {
                 } else if (!job.file_name.empty()) {
                         play_sound(job.file_name);
                 }
+
+                if (shutdown_requested.load()) {
+                        continue;
+                }
+
+                if (job.deferred_action == SoundJob::DeferredAction::StartRecording) {
+                        if (!obs_frontend_recording_active()) {
+                                obs_frontend_recording_start();
+                        }
+                } else if (job.deferred_action == SoundJob::DeferredAction::UnpauseRecording) {
+                        if (obs_frontend_recording_active() && obs_frontend_recording_paused()) {
+                                obs_frontend_recording_pause(false);
+                        }
+                }
         }
 }
 
+static bool mode_uses_deferred_hotkeys() {
+        RecordStartMuteConfig config = load_record_config();
+        return config.enabled_mode == 2;
+}
+
+static bool hotkey_has_bindings(obs_hotkey_id hotkey_id) {
+        if (hotkey_id == OBS_INVALID_HOTKEY_ID) {
+                return false;
+        }
+
+        obs_data_array_t *saved = obs_hotkey_save(hotkey_id);
+        size_t count = saved ? obs_data_array_count(saved) : 0;
+        if (saved) {
+                obs_data_array_release(saved);
+        }
+
+        return count > 0;
+}
+
+static void apply_hotkey_fallback_if_unbound(obs_hotkey_id hotkey_id, const std::string &fallback_spec, const char *hotkey_name) {
+        if (hotkey_id == OBS_INVALID_HOTKEY_ID || fallback_spec.empty()) {
+                return;
+        }
+
+        if (hotkey_has_bindings(hotkey_id)) {
+                blog(LOG_INFO, "SRBeep2: '%s' already has UI bindings; .ini fallback ignored.", hotkey_name);
+                return;
+        }
+
+        obs_key_combination_t combo = {};
+        if (!parse_hotkey_combination(fallback_spec, combo)) {
+                blog(LOG_WARNING, "SRBeep2: Invalid %s fallback hotkey '%s'.", hotkey_name, fallback_spec.c_str());
+                return;
+        }
+
+        obs_hotkey_load_bindings(hotkey_id, &combo, 1);
+        blog(LOG_INFO, "SRBeep2: Applied .ini fallback hotkey for '%s': %s", hotkey_name, fallback_spec.c_str());
+}
+
+static void on_record_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed) {
+        unused(data);
+        unused(id);
+        unused(hotkey);
+
+        if (!pressed || !mode_uses_deferred_hotkeys()) {
+                return;
+        }
+
+        if (!obs_frontend_recording_active()) {
+                queue_deferred_sound_job("/record_start_sound.mp3", true, SoundJob::DeferredAction::StartRecording);
+                return;
+        }
+
+        queue_stop_sound_job("/record_stop_sound.mp3");
+}
+
+static void on_pause_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed) {
+        unused(data);
+        unused(id);
+        unused(hotkey);
+
+        if (!pressed || !mode_uses_deferred_hotkeys()) {
+                return;
+        }
+
+        if (!obs_frontend_recording_active()) {
+                return;
+        }
+
+        if (obs_frontend_recording_paused()) {
+                queue_deferred_sound_job("/pause_stop_sound.mp3", true, SoundJob::DeferredAction::UnpauseRecording);
+                return;
+        }
+
+        obs_frontend_recording_pause(true);
+}
+
 void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, void * private_data) {
+        unused(private_data);
+        RecordStartMuteConfig config = load_record_config();
+        const bool beeps_disabled = config.enabled_mode == 0;
+        const bool deferred_mode = config.enabled_mode == 2;
+
+        if (beeps_disabled) {
+                if (event == OBS_FRONTEND_EVENT_RECORDING_STARTED || event == OBS_FRONTEND_EVENT_RECORDING_UNPAUSED) {
+                        enforce_input_capture_device(config);
+                }
+                return;
+        }
+
         if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED) {
                 queue_sound_job("/stream_start_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_STARTED) {
-                queue_sound_job("/record_start_sound.mp3", true);
+                if (!deferred_mode) {
+                        queue_sound_job("/record_start_sound.mp3", true);
+                }
         } else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED) {
                 queue_sound_job("/buffer_start_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_PAUSED) {
@@ -642,12 +888,22 @@ void obsstudio_srbeep_frontend_event_callback(enum obs_frontend_event event, voi
         } else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED) {
                 queue_stop_sound_job("/buffer_stop_sound.mp3");
         } else if (event == OBS_FRONTEND_EVENT_RECORDING_UNPAUSED) {
-                queue_sound_job("/pause_stop_sound.mp3", true);
+                if (!deferred_mode) {
+                        queue_sound_job("/pause_stop_sound.mp3", true);
+                }
         }
 }
 
 extern "C" void obs_module_unload(void) {
         obs_frontend_remove_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
+        if (record_toggle_hotkey != OBS_INVALID_HOTKEY_ID) {
+                obs_hotkey_unregister(record_toggle_hotkey);
+                record_toggle_hotkey = OBS_INVALID_HOTKEY_ID;
+        }
+        if (pause_toggle_hotkey != OBS_INVALID_HOTKEY_ID) {
+                obs_hotkey_unregister(pause_toggle_hotkey);
+                pause_toggle_hotkey = OBS_INVALID_HOTKEY_ID;
+        }
         shutdown_requested = true;
         {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
@@ -678,6 +934,8 @@ extern "C" const char * obs_module_description(void) {
 }
 
 extern "C" bool obs_module_load(void) {
+        RecordStartMuteConfig config;
+
         shutdown_requested = false;
         if (SDL_Init(0) < 0) {
                 blog(LOG_ERROR, "SRBeep2: SDL_Init failed: %s", SDL_GetError());
@@ -689,7 +947,7 @@ extern "C" bool obs_module_load(void) {
                 return false;
         }
         {
-                RecordStartMuteConfig config = load_record_config();
+                config = load_record_config();
                 audio_fade_on_stop_duration_ms = config.audio_fade_on_stop_duration_ms;
         }
         {
@@ -697,6 +955,22 @@ extern "C" bool obs_module_load(void) {
                 audioWorkerRunning = true;
         }
         audioWorkerThread = std::thread(audio_worker_loop);
+        record_toggle_hotkey = obs_hotkey_register_frontend(
+                "srbeep2.toggle_recording_deferred",
+                "SRBeep2: Toggle Recording",
+                on_record_toggle_hotkey,
+                NULL
+        );
+        pause_toggle_hotkey = obs_hotkey_register_frontend(
+                "srbeep2.toggle_pause_deferred",
+                "SRBeep2: Toggle Pause",
+                on_pause_toggle_hotkey,
+                NULL
+        );
+
+        apply_hotkey_fallback_if_unbound(record_toggle_hotkey, config.record_toggle_hotkey_fallback, "Toggle Recording");
+        apply_hotkey_fallback_if_unbound(pause_toggle_hotkey, config.pause_toggle_hotkey_fallback, "Toggle Pause");
+
         obs_frontend_add_event_callback(obsstudio_srbeep_frontend_event_callback, 0);
         return true;
 }

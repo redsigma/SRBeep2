@@ -77,6 +77,7 @@ std::deque<SoundJob> audioJobs;
 std::atomic_bool interrupt_current_track = false;
 std::atomic_uint32_t audio_fade_on_stop_duration_ms = 0;
 std::atomic_bool shutdown_requested = false;
+std::atomic_bool deferred_start_pending = false;
 
 std::mutex playbackStateMutex;
 std::condition_variable playbackStateCv;
@@ -717,6 +718,9 @@ static void queue_deferred_sound_job(const char *file_name, bool apply_record_st
                 job.deferred_action = deferred_action;
                 audioJobs.push_back(job);
         }
+        if (deferred_action == SoundJob::DeferredAction::StartRecording) {
+                deferred_start_pending = true;
+        }
         audioJobCv.notify_one();
 }
 
@@ -770,7 +774,7 @@ static void audio_worker_loop() {
                 }
 
                 if (job.deferred_action == SoundJob::DeferredAction::StartRecording) {
-                        if (!obs_frontend_recording_active()) {
+                        if (deferred_start_pending.exchange(false) && !obs_frontend_recording_active()) {
                                 obs_frontend_recording_start();
                         }
                 } else if (job.deferred_action == SoundJob::DeferredAction::UnpauseRecording) {
@@ -830,6 +834,18 @@ static void on_record_toggle_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *
         }
 
         if (!obs_frontend_recording_active()) {
+                if (deferred_start_pending.load()) {
+                        {
+                                std::lock_guard<std::mutex> lock(audioJobMutex);
+                                deferred_start_pending = false;
+                                interrupt_current_track = true;
+                                audioJobs.clear();
+                        }
+                        playbackStateCv.notify_all();
+                        audioJobCv.notify_all();
+                        return;
+                }
+
                 queue_deferred_sound_job("/record_start_sound.mp3", true, SoundJob::DeferredAction::StartRecording);
                 return;
         }
@@ -905,6 +921,7 @@ extern "C" void obs_module_unload(void) {
                 pause_toggle_hotkey = OBS_INVALID_HOTKEY_ID;
         }
         shutdown_requested = true;
+        deferred_start_pending = false;
         {
                 std::lock_guard<std::mutex> lock(audioJobMutex);
                 interrupt_current_track = true;
